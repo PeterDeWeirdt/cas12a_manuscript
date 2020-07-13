@@ -1,0 +1,839 @@
+---
+title: "Synlet Notebook"
+---
+
+# Setup 
+```{r}
+library(tidyverse)
+library(here)
+library(ggpubr) 
+library(viridis) 
+library(extrafont)
+loadfonts() # to get Arial
+library(ggrastr) 
+library(ggrepel)
+library(ggridges)
+library(broom)
+#MASS
+```
+
+```{r}
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+get_guide_residuals <- function(base_lfcs, type = 'DR') {
+  # Use a linear model esimate combinatorial effects
+  #
+  # Args:
+  #   data: tibble with columns assay, control1, control2, Avg. LFC, Base LFC 1, 
+  #   Base LFC 2
+  #
+  # Returns:
+  #   tibble of guide combinations and residuals
+  if (type == 'DR') {
+    grouped_base <- base_lfcs %>%
+      group_by(assay, DR)
+  } else if (type == 'system') {
+    grouped_base <- base_lfcs %>%
+      group_by(assay, system)
+  } else if (type == 'quartile') {
+    grouped_base <- base_lfcs %>%
+      group_by(assay, DR, pair_quartile)
+  } else {
+    grouped_base <- base_lfcs %>%
+      group_by(assay)
+  }
+  expected_activity <- grouped_base %>%
+    nest() %>%
+    mutate(model = map(data, function(df) {
+        model = lm(`Avg. LFC` ~ `Base LFC 1` + `Base LFC 2`, df %>%
+                     filter(xor(control1, control2)))
+        return(model)
+        }),
+      `Expected LFC` = map2(model, data, function(m, df) {
+        predictions = predict.lm(m, df)
+        return(predictions)
+      })) %>%
+    unnest(c('data', 'Expected LFC')) %>%
+    select(-model) %>%
+    mutate(Residual = `Avg. LFC` - `Expected LFC`)
+  return(expected_activity)
+} 
+
+theme_manuscript <- function() {
+    theme(text = element_text(size = 8, family = 'Arial'), 
+          aspect.ratio = 1,
+          legend.box.margin = margin(t = 2, r = 2, b = 2, l = 2),
+          legend.box.spacing = unit(2,'pt'), 
+          legend.key.size = unit(10, 'pt'), 
+          legend.title = element_text(size = 9),
+          plot.title = element_text(size = 9, hjust = 0.5), 
+          strip.text = element_text(size = 8),
+          legend.text = element_text(size = 8))
+}
+```
+
+```{r}
+read_counts <- read_csv(here('data', 'raw', 'synlet_reads_day21_174.csv'))
+cas12a_designs <- read_tsv(here('data','external',
+                                  '2019-05-02_sgrna-designs-ontarg.txt')) 
+bp_inputs <- read_csv(here('data', 'processed',
+                           'synlet_BP_inputs.csv'))
+```
+
+
+# Library Design
+We tested the multiplexing ability of enCas12a with a library of synthetically lethal gene pairs. Describe and cite the library. For each gene in a gene pair, we randomly picked up to 20 guides, 15 and 5 of which had TTTV and TTTT PAMs respectively. We selected the guides without using on-target rules so we could use the results as a hold-out validation set. We screened pairs in both orientations and tested three of our top direct repeats between guides. To measure the effect of single gene knockout, we also included 25 control guides each targeting an olfactory gene. These 25 controls were paired with the target guides in both orientations with the 3 direct repeats. We evaluated the library in A375 and OVCAR8 cell lines. 
+
+```{r}
+melted_reads <- read_counts %>% gather(assay, reads, -c(`Construct Barcode`, `Construct IDs`))
+melted_lognorms <- melted_reads %>% 
+  group_by(assay) %>%
+  mutate(lognorm = log2(reads/sum(reads)*1000000 + 1))%>%
+  ungroup()
+pdna_lognorms <- melted_lognorms %>%
+  filter(assay == 'pDNA') %>%
+  select(-assay)
+melted_lfcs <- melted_lognorms %>%
+  filter(assay != 'pDNA') %>%
+  inner_join(pdna_lognorms, by = c('Construct Barcode', 'Construct IDs'), 
+             suffix = c('', '_pdna')) %>%
+  mutate(lfc = lognorm - lognorm_pdna) %>%
+  separate(assay, into = c('assay', 'rep'), sep = '_')
+```
+
+# QC
+
+To determine the viability effect of each construct, we took the log2-fold-change relative to plasmid DNA. We saw that replicates were well correlated. 
+
+```{r}
+rep_lfcs <- melted_lfcs %>%
+  select(`Construct Barcode`:rep, lfc) %>%
+  spread(rep, lfc) %>%
+  group_by(assay) %>%
+  mutate(density = get_density(A, B, n = 100))
+
+plot_rep_lfcs <- function(df, assay) {
+  p = ggplot(df) +
+    aes(x = A, y = B) +
+    geom_point_rast(aes(color = density), raster.width = 3, raster.height = 3) +
+    coord_equal() +
+    scale_color_viridis() +
+    theme_classic() +
+    theme(text = element_text(size = 10, family = 'Arial'), 
+          #legend.position = 'bottom',
+          #legend.text = element_text(angle = 90, vjust = 0.5, hjust = 0.25), 
+          legend.box.spacing = unit(0.1, 'cm'), 
+          legend.key.width = unit(0.2, 'cm')) +
+    stat_cor(aes(label = ..r.label..), size=3) +
+    xlab('Rep A LFC') +
+    ylab('Rep B LFC') +
+    ggtitle(assay)
+  return(p)
+}
+plot_rep_lfcs(rep_lfcs %>% filter(assay == 'A375'), 'A375')
+ggsave(here('figures', 'synlet', 'A375_replicate_correlations.svg'),
+       width = 6, height = 6, units = 'cm')
+plot_rep_lfcs(rep_lfcs %>% filter(assay == 'OVCAR8'), 'OVCAR8')
+ggsave(here('figures', 'synlet', 'OVCAR8_replicate_correlations.pdf'),
+       width = 6, height = 6, units = 'cm', useDingbats = FALSE)
+```
+
+```{r}
+interim_lfcs = rep_lfcs %>%
+  mutate(`Avg. LFC` = (A+B)/2) %>%
+  separate(`Construct IDs`, sep = ';|:', c('guide1', 'DR', 'guide2', 'gene1', 'gene2')) %>%
+  mutate(control1 = grepl('OR', gene1), 
+         control2 = grepl('OR', gene2))
+prog_pairs = interim_lfcs %>%
+  mutate(guide1 = paste(guide1, DR, sep = ':'), 
+         guide2 = paste(guide2, DR, sep = ':')) %>%
+  select(-c(DR, `Construct Barcode`, A, B, density)) %>%
+  rename(context = assay) %>%
+  ungroup() %>%
+  pivot_wider(names_from = context, values_from = `Avg. LFC`)
+melted_lfcs = interim_lfcs %>%
+         mutate(DR_name = recode(DR, 'TAATTTCTACTGTCGTAGAT' = 'DR1', 
+                           'TAATTTCTACTATCGTAGAT' = 'DR2', 
+                           'AAATTTCTACTCTAGTAGAT' = 'DR3'))
+```
+
+# Outlier Removal
+We saw that one control guide had a viability effect, so we removed it for all downstream analyses.
+In order to check if any of the control guides had a viability effect, we consider the LFCs all control-control pairs. We see that OR5W2 has a viability effect in position one, so we will remove it for downstream analyses.  
+
+```{r}
+or_lfc = melted_lfcs %>%
+  filter(control1 & control2)
+or_position1_LFCs = or_lfc %>%
+  group_by(gene1, assay) %>%
+  summarise(`Avg. LFC (Pos. 1)` = mean(`Avg. LFC`))
+or_position2_LFCs = or_lfc %>%
+  group_by(gene2, assay) %>%
+  summarise(`Avg. LFC (Pos. 2)` = mean(`Avg. LFC`))
+or_position_LFCs = inner_join(or_position1_LFCs, or_position2_LFCs, by = c('gene1' = 'gene2', 'assay')) %>%
+  rename(gene = gene1)
+ggplot(or_position_LFCs) +
+  aes(x = `Avg. LFC (Pos. 1)`, y = `Avg. LFC (Pos. 2)`, label = gene) +
+  geom_point(size = 1) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial')) +
+  coord_equal() +
+  geom_text_repel(data = or_position_LFCs %>%
+                    filter(gene %in% c('OR5W2', 'OR13H1')), 
+                  size = 3, 
+                  nudge_y = 0.2) +
+  facet_wrap('assay') +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  geom_vline(xintercept = 0, linetype = 'dashed') 
+ggsave(here('figures','synlet','olfactory_outliers.svg'),
+       width = 10, height = 6, units = 'cm')
+```
+
+```{r}
+filtered_lfcs <- melted_lfcs %>%
+  filter(!(gene1 %in%  c('OR5W2','OR13H1')) & !(gene2 %in% c('OR5W2','OR13H1'))) %>%
+  ungroup() %>%
+  rename(control1 = control1, control2 = control2)
+```
+
+# Position Dependent Effects
+To understand the position dependent effects of the multiplexed system we compared the LFCs of target guides in the first and second positions when paired with controls. We saw a strong correlation between the LFCs of guides in both orientations. 
+
+```{r}
+target_control_lfc = filtered_lfcs %>%
+  filter(control2 & !(control1)) %>%
+  rename(target_guide = guide1, or_guide = guide2, 
+         target_gene = gene1, or_gene = gene2) %>%
+  select(-c(density, control1, control2, A, B, `Construct Barcode`))
+control_target_lfc = filtered_lfcs %>%
+  filter(control1 & !(control2)) %>%
+  rename(target_guide = guide2, or_guide = guide1, 
+         target_gene = gene2, or_gene = gene1) %>%
+  select(-c(density, control1, control2, A, B, `Construct Barcode`))
+target_position_LFCs = inner_join(target_control_lfc, control_target_lfc, 
+                                  by = setdiff(colnames(target_control_lfc),c('Avg. LFC')), 
+                                  suffix = c(' (Pos. 1)', ' (Pos. 2)')) %>%
+  group_by(assay) %>%
+  mutate(density = get_density(`Avg. LFC (Pos. 1)`, `Avg. LFC (Pos. 2)`, n = 100))
+plot_position_cor <- function(df, assay) {
+  p = ggplot(df) +
+    aes(x = `Avg. LFC (Pos. 1)`, y = `Avg. LFC (Pos. 2)`, color = density, 
+        label = paste(target_gene, DR_name, or_gene)) +
+    facet_wrap('DR_name')+ 
+    geom_point_rast(aes(color = density), size =1, raster.width = 3, raster.height = 3) +
+    scale_color_viridis() +
+    geom_abline() +
+    theme_classic() +
+    theme(aspect.ratio = 1, 
+          text = element_text(size = 10, family = 'Arial'), 
+          legend.box.spacing = unit(0.1, 'cm'), 
+          legend.key.height = unit(0.2, 'cm'), 
+          legend.position = 'top', 
+          plot.title = element_text(size = 10, face = 'bold')) +
+    stat_cor(aes(label = ..r.label..), size=3) +
+    ggtitle(paste(assay))
+  return(list(p = p, lfcs = target_position_LFCs))
+}
+ovc_p_lfcs <- plot_position_cor(target_position_LFCs %>% filter(assay == 'OVCAR8'), 'OVCAR8')
+ovc_p_lfcs$p
+ggsave(here('figures', 'synlet', 'ovcar_position_correlations.svg'),
+       width = 8, height = 6, units = 'cm')
+a375_p_lfcs <- plot_position_cor(target_position_LFCs %>% filter(assay == 'A375'), 'A375')
+a375_p_lfcs$p
+ggsave(here('figures', 'synlet', 'A375_position_correlations.svg'),
+       width = 10, height = 6, units = 'cm')
+```
+
+```{r}
+ovc_guide_lfcs <- ovc_p_lfcs$lfcs %>%
+  group_by(target_guide, DR, DR_name, target_gene, assay) %>%
+  summarise(avg_lfc_pos1 = mean(`Avg. LFC (Pos. 1)`), 
+            avg_lfc_pos2 = mean(`Avg. LFC (Pos. 2)`)) 
+a375_guide_lfcs <- a375_p_lfcs$lfcs %>%
+  group_by(target_guide, DR, DR_name, target_gene, assay) %>%
+  summarise(avg_lfc_pos1 = mean(`Avg. LFC (Pos. 1)`), 
+            avg_lfc_pos2 = mean(`Avg. LFC (Pos. 2)`)) 
+all_guide_lfcs <- bind_rows(ovc_guide_lfcs, a375_guide_lfcs) %>%
+  arrange(-avg_lfc_pos1)
+```
+
+
+# Residual
+We measured the syntehtic effect of guides by using the residual between the expected and observed LFCs. We use a linear model fit to target guides paired with controls to estimate the expected LFCs of target pairs. For a construct with the ordered elements guide1, DR, guide2, we say $Avg.\ LFC_{guide1,\ DR,\ guide2}^{expected} =  m*(Avg.\ LFC_{guide1,\ DR,\ controls} + Avg.\ LFC_{controls,\ DR,\ guide2}) + \beta,$ where $m$ is a fitted slope and $\beta$ is an intercept. The residual is the difference between the observed and expected LFCs. 
+```{r}
+guide1_base_lfcs <- filtered_lfcs %>%
+  filter(control2) %>%
+  group_by(`guide1`, DR, gene1, assay, DR_name) %>%
+  summarise(`Base LFC 1` = mean(`Avg. LFC`))
+guide2_base_lfcs <- filtered_lfcs %>%
+  filter(control1) %>%
+  group_by(`guide2`, DR, gene2, assay, DR_name) %>%
+  summarise(`Base LFC 2` = mean(`Avg. LFC`))
+gene_base_lfcs <- guide1_base_lfcs %>%
+  rename(gene = gene1, `Base LFC` = `Base LFC 1`) %>%
+  bind_rows(guide2_base_lfcs %>%
+               rename(gene = gene2, `Base LFC` = `Base LFC 2`)) %>%
+  ungroup() %>%
+  mutate(gene = ifelse(grepl('OR', gene), 'control', gene)) %>%
+  group_by(gene, assay) %>%
+  summarise(`Avg. LFC` = mean(`Base LFC`)) %>%
+  ungroup() %>%
+  mutate(gene = fct_reorder(gene, -`Avg. LFC`))
+ggplot(gene_base_lfcs) +
+  aes(y = gene, x = assay, fill = `Avg. LFC`) +
+  geom_tile(color = 'black') +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(color = 'black'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.title = element_text(size = 8), 
+        legend.position = 'top') +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_gradient2(breaks = c(0,-1,-2)) +
+  coord_equal() +
+  xlab('') +
+  ylab('') +
+  guides(fill = guide_colorbar(title.position = 'top',
+                             label.theme = element_text(size = 8),
+                             barheight = unit(0.2, 'cm'), 
+                             barwidth = unit(1.3, 'cm')))
+ggsave(here('figures','synlet', 'single_gene_effect.svg'), width = 6, height = 12)
+```
+
+```{r}
+base_lfcs <- filtered_lfcs %>%
+  inner_join(guide1_base_lfcs) %>%
+  inner_join(guide2_base_lfcs) %>%
+  mutate(`controls` = as.factor(control1 + control2), 
+         sum_lfc = `Base LFC 1` + `Base LFC 2`)
+plot_model_fit <- function(base_lfcs, curr_assay) {
+  assay_lfcs <- base_lfcs %>%
+    filter(assay == curr_assay, 
+           controls != 2) %>%
+    mutate(type = ifelse(controls == 1, 'Control', 'Target'))
+  control_lfcs = assay_lfcs %>%
+    filter(controls == 1)
+  control_residuals = lm(`Avg. LFC`~sum_lfc, data = control_lfcs)$residuals
+  control_error = mean(control_residuals) + 2*sd(control_residuals)
+  p <- ggplot(assay_lfcs) +
+    aes(x = sum_lfc, y = `Avg. LFC`) +
+    geom_point_rast(alpha = 0.7, aes(color = type), pch = 20, raster.width = 3.2, 
+                    raster.height = 3.2, raster.dpi = 600) +
+    theme_minimal() +
+    theme(text = element_text(size = 10, family = 'Arial'), 
+          aspect.ratio = 1, plot.title = element_text(size = 10, face = 'bold'), 
+          legend.key.size = unit(0.5, 'cm')) +
+    scale_color_manual(values = c('grey', '#1f78b4')) +
+    geom_smooth(data = base_lfcs %>% filter(controls == 1),
+                method = 'lm', color = 'black', size = 0.5, se = FALSE) +
+    geom_smooth(data = base_lfcs %>% filter(controls == 1) %>%
+                  mutate(down_lm = `Avg. LFC` - control_error),
+            aes(y = down_lm),
+            method = 'lm', linetype = 'dashed', size = 0.5, se = FALSE,
+            color = 'black') +
+    ggtitle(paste(curr_assay,'Guide Pair LFCs')) +
+    xlab('guide1/controls + controls/guide2') +
+    ylab('guide1/guide2') 
+  return(p)
+}
+plot_model_fit(base_lfcs, 'A375')
+ggsave(here('figures','synlet','a375_linear_model.svg'), 
+       width = 8, height = 8, units = 'cm')
+plot_model_fit(base_lfcs, 'OVCAR8')
+ggsave(here('figures','synlet','ovcar8_linear_model.svg'), useDingbats = FALSE, 
+       width = 8, height = 8, units = 'cm')
+
+guide_residuals <- get_guide_residuals(base_lfcs, type = 'assay')
+write_csv(guide_residuals, here('data', 'processed', 'synlet_guide_residuals.csv'))
+```
+
+
+```{r}
+named_residuals <- guide_residuals %>%
+  filter(!(control1 & control2)) %>%
+  mutate(nameA = ifelse(control1, gene2, ifelse(control2, gene1, ifelse(gene1 < gene2, gene1, gene2))),
+         nameB = ifelse(control1 | control2, 'control', ifelse(gene2 < gene1, gene1, gene2)), 
+         Pair = paste(nameA, nameB, sep = '/'), 
+         name = ifelse(control1 | control2, 'Control', Pair)) 
+plot_residual_dist <- function(named_residuals, curr_assay) {
+  assay_named_resid <- named_residuals %>%
+    filter(assay == curr_assay) %>%
+    mutate(temp_ctl = control1 | control2,
+           ctl = factor(temp_ctl, levels = c('TRUE','FALSE')))
+  control_data <- assay_named_resid %>%
+    filter(control1 | control2)
+  cutoff = mean(control_data$Residual) - 2*sd(control_data$Residual)
+  percent_syn <- assay_named_resid %>%
+    group_by(name, ctl) %>%
+    summarise(fraction_syn = sum(Residual < cutoff)/n(), 
+              percent_syn = paste0(round(fraction_syn, 2)*100, '%'), 
+              n = n(), 
+              number = paste0('n=', n))
+  assay_named_resid <- assay_named_resid %>%
+    full_join(percent_syn) %>%
+    mutate(name = fct_reorder(name, fraction_syn))
+    
+  p = ggplot(assay_named_resid) +
+    aes(x = Residual, y = name) +
+    geom_density_ridges(scale =2) +
+    facet_grid(rows = vars(ctl), scales = 'free_y', space = 'free') +
+    theme_bw() +
+    theme(strip.background = element_blank(),
+          strip.text.y = element_blank(), 
+          text = element_text(size = 10, family = 'Arial'), 
+          plot.title = element_text(size = 10, face = 'bold'),
+          axis.text.y = element_text(color = 'black')) +
+    geom_label(data = percent_syn, aes(x = -Inf, label = percent_syn, hjust = 0), 
+               label.padding = unit(0.05, 'cm'), size = 3) +
+    geom_label(data = percent_syn, aes(x = Inf, label = n, hjust = 1), 
+           label.padding = unit(0.05, 'cm'), size = 3) +
+    geom_vline(aes(xintercept = cutoff), linetype = 'dashed') +
+    ylab('') +
+    ggtitle(paste(curr_assay, 'Guide Pairs'))
+  return(list(p = p, percent_syn = percent_syn))
+}
+syn_active_all_a375 <- plot_residual_dist(named_residuals, 'A375')
+syn_active_all_a375$p
+ggsave(here('figures', 'synlet', 'A375_residual_dist.svg'), 
+       width =9, height = 9, units = 'cm')
+syn_active_all_ovcar8 <- plot_residual_dist(named_residuals, 'OVCAR8')
+syn_active_all_ovcar8$p
+ggsave(here('figures', 'synlet', 'ovcar8_residual_dist.svg'), 
+       width =9, height = 9, units = 'cm')
+```
+
+```{r}
+tttv_named_residuals <- named_residuals %>%
+  inner_join(cas12a_designs %>% select('sgRNA Sequence', 'Seq-DeepCpf1 Score',
+                                       'PAM Sequence'), 
+             by = c('guide1' = 'sgRNA Sequence')) %>%
+  inner_join(cas12a_designs %>% select('sgRNA Sequence', 'Seq-DeepCpf1 Score',
+                                       'PAM Sequence'), 
+             by = c('guide2' = 'sgRNA Sequence'), suffix = c('1', '2')) %>%
+  filter(grepl('TTT(A|C|G)',`PAM Sequence1`), 
+         grepl('TTT(A|C|G)',`PAM Sequence2`))
+syn_active_tttv_a375 <- plot_residual_dist(tttv_named_residuals, 'A375')
+syn_active_tttv_ovcar8 <- plot_residual_dist(tttv_named_residuals, 'OVCAR8')
+bound_tttv_synthetic <- bind_rows(syn_active_tttv_a375$percent_syn %>% 
+                                        mutate(cell = 'A375'), 
+                                      syn_active_tttv_ovcar8$percent_syn %>% 
+                                        mutate(cell = 'OVCAR8'))
+write_csv(bound_tttv_synthetic, here('data', 'processed', 'fraction_synthetic_tttv_174.csv'))
+```
+
+```{r}
+bound_fraction_synthetic <- bind_rows(syn_active_all_a375$percent_syn %>% 
+                                        mutate(cell = 'A375'), 
+                                      syn_active_all_ovcar8$percent_syn %>% 
+                                        mutate(cell = 'OVCAR8'))
+write_csv(bound_fraction_synthetic, here('data', 'processed', 'fraction_synthetic_174.csv'))
+```
+
+```{r}
+library(reticulate)
+use_virtualenv(here('cas12a_manuscript'), required = T)
+all_guides <- tibble(`sgRNA Sequence` = unique(c(filtered_lfcs$guide1, filtered_lfcs$guide2)))
+guide_contexts <- inner_join(all_guides, cas12a_designs)
+all_context <- guide_contexts$`sgRNA Context Sequence`
+```
+
+```{python}
+from sgrna_modeler import models as sg
+from sgrna_modeler import enzymes as en
+import pandas as pd
+
+model = sg.SklearnSgrnaModel()
+model_weights = sg.get_enpam_gb()
+model.load_model(model_weights, en.cas12a, 'enPAM_GB')
+
+predictions = model.predict_seqs(r.all_context)
+predictions_df = pd.DataFrame({'enGB' : predictions, 'sgRNA Context Sequence' : r.all_context})
+```
+
+```{r}
+joined_scores <- inner_join(guide_contexts, py$predictions_df)
+ggplot(joined_scores) +
+  aes(x = enGB, y = `Seq-DeepCpf1 Score`, color = `PAM Sequence`) +
+  geom_point()
+```
+
+```{r}
+target_guide_ranks <- base_lfcs %>%
+  filter(!control1) %>%
+  select(guide1, gene1) %>%
+  distinct() %>%
+  inner_join(joined_scores %>% select('sgRNA Sequence', 'enGB',
+                                       'PAM Sequence'), 
+             by = c('guide1' = 'sgRNA Sequence')) %>%
+  group_by(gene1) %>%
+  mutate(percentile = percent_rank(enGB)) %>%
+  rename(guide=guide1) %>%
+  ungroup() %>%
+  rename(gene = gene1)
+
+cas12a_residual_designs <- named_residuals %>%
+  left_join(target_guide_ranks, by = c('guide1' = 'guide', 'gene1' = 'gene')) %>%
+  left_join(target_guide_ranks, by = c('guide2' = 'guide', 'gene2' = 'gene'), 
+             suffix = c('.1','.2'))
+top_half_residuals <- cas12a_residual_designs %>%
+  filter((percentile.1 > 0.5 & percentile.2 > 0.5) | control1 | control2)
+syn_active_filt_a375 <- plot_residual_dist(top_half_residuals, 'A375')
+syn_active_filt_a375$p
+ggsave(here('figures', 'synlet', 'a375_filt_residual_dist.svg'), 
+       width =9, height = 9, units = 'cm')
+syn_active_filt_ovcar8 <- plot_residual_dist(top_half_residuals, 'OVCAR8')
+syn_active_filt_ovcar8$p
+ggsave(here('figures', 'synlet', 'ovcar_filt_residual_dist.svg'), 
+       width =9, height = 9, units = 'cm')
+```
+
+```{r}
+plot_diff_syn <- function(all_syn, filtered_syn) {
+  increased_activity <-  all_syn %>%
+    full_join(filtered_syn, by = 'name',
+               suffix = c('.all','.filt')) %>%
+    select(name, fraction_syn.all, fraction_syn.filt)
+  p = ggplot(increased_activity) +
+    aes(x = fraction_syn.all, y = fraction_syn.filt, label = name) +
+    geom_abline() +
+    geom_point(color = 'indianred') +
+    coord_equal() +
+    xlim(0,1) +
+    ylim(0,1) +
+    xlab('All pairs') +
+    ylab('Top half of guides') +
+    theme_minimal() +
+    theme_manuscript() +
+    theme(plot.title = element_text(size = 9),
+          axis.text = element_text(size = 8.5)) +
+    geom_text_repel(data = subset(increased_activity,
+                                  fraction_syn.filt >= 0.5),
+                    size = 2.5,
+                    nudge_x = 0.1 - subset(increased_activity,
+                                  fraction_syn.filt >= 0.5)$fraction_syn.all,
+                    direction = 'y',
+                    segment.color = "grey50",
+                    segment.size  = 0.3) +
+    geom_text_repel(data = subset(increased_activity,
+                                fraction_syn.filt < 0.5),
+                  size = 2.5,
+                  nudge_x = 0.8 - subset(increased_activity,
+                                fraction_syn.filt < 0.5)$fraction_syn.all,
+                  direction = 'y',
+                  segment.color = "grey50",
+                  segment.size  = 0.3)
+  return(p)
+}
+plot_diff_syn(syn_active_all_ovcar8$percent_syn, syn_active_filt_ovcar8$percent_syn) +
+  ggtitle('OVCAR8 Fraction Synthetic')
+ggsave(here('figures', 'synlet', 'ovcar8_on_targ_filt.svg'), 
+       width = 7, height = 7, units = 'cm')
+plot_diff_syn(syn_active_all_a375$percent_syn, syn_active_filt_a375$percent_syn) +
+  ggtitle('A375 Fraction Synthetic')
+ggsave(here('figures', 'synlet', 'a375_on_targ_filt.svg'), 
+       width = 8, height = 8, units = 'cm')
+```
+
+# Multiplexed enCas12a vs Big Papi
+We used existing Synthetic Lethal (SynLet) Big Papi data to compare with the multiplexed enCas12a system. Both libraries target MAPK1 and MAPK3, PARP1 and PARP2, BCL2L1 and MCL1, BCL2L1 and BCL2L2, MAP2K1 and MAP2K2, and BRCA1 and PARP1. Due to the heterogeneity of the library designs, we filtered both data sets to make for a fair comparison. To mitigate off-target effects in the enCas12a library we removed guides that were predicted to cut in alternative protein-coding regions between 20 and 100 percent of the time (Tier I, Bins I and II in sgRNA designer). We then maximized on-target efficacy of target guides by removing guides that cut in the first 5 or last 20 percent of the coding sequence of a gene. Then to match the number of guides in the Big Papi library we used Seq-DeepCpf1 to pick the 3 or 15 best remaining guides for target or control genes respectively. After filtering we had less than 3 guides for MAP2K1, MAP2K2 and BCL2L2 so we removed pairs with these genes from the comparison. We filtered the Big Papi Synlet library for the afformentioned target pairs (3 guides per gene) as well as 15 control guides targetting the cell surface marker CD81 (10 guides) and the intronic regions of HPRT1 (5 guides). Note that the original librray design already included on and off-target filters.
+
+## Filter enCas12a data
+```{r}
+encas12a_pairs <- unique(ifelse(filtered_lfcs$gene1 < filtered_lfcs$gene2, 
+                                paste(filtered_lfcs$gene1, filtered_lfcs$gene2, sep = '_'), 
+                                paste(filtered_lfcs$gene2, filtered_lfcs$gene1, sep = '_')))
+bp_pairs <- unique(ifelse(bp_inputs$gene1 < bp_inputs$gene2, 
+                          paste(bp_inputs$gene1,bp_inputs$gene2, sep = '_'), 
+                          paste(bp_inputs$gene2,bp_inputs$gene1, sep = '_')))
+compare_pairs <- intersect(encas12a_pairs, bp_pairs)
+compare_pairs
+```
+
+```{r}
+compare_genes <- c('MAPK1', 'MAPK3', 'PARP1', 'PARP2', 'BCL2L1', 'MCL1', 
+                   'BCL2L2', 'MAP2K1', 'MAP2K2', 'BRCA1')
+cas12a_compare_guides <- filtered_lfcs %>%
+  mutate(pair = ifelse(gene1 < gene2,
+                       paste(gene1, gene2, sep = '_'),
+                       paste(gene2, gene1, sep = '_'))) %>%
+  filter((gene1 %in% compare_genes & control2) |
+           (gene2 %in% compare_genes & control1) |
+           (pair %in% compare_pairs) |
+           (control1 & control2), 
+         DR_name == 'DR1')
+cas12a_compare_guides %>%
+  filter(!(control1 | control2)) %>%
+  select(guide1, gene1) %>%
+  distinct() %>%
+  group_by(gene1) %>%
+  summarise(n()) 
+```
+
+```{r}
+cas12a_compare_guides %>%
+  filter(!(control1 | control2)) %>%
+  select(guide2, gene2) %>%
+  distinct() %>%
+  group_by(gene2) %>%
+  summarise(n())
+```
+
+```{r}
+cas12a_compare_guides %>%
+  filter((control1)) %>%
+  select(guide1) %>%
+  distinct() %>%
+  nrow()
+```
+
+```{r}
+cas12a_compare_guides %>%
+  filter((control2)) %>%
+  select(guide2) %>%
+  distinct() %>%
+  nrow()
+```
+
+```{r}
+cas12a_compare_guides_list <- unique(cas12a_compare_guides$guide1)
+cas12a_compare_designs <- joined_scores %>% 
+  filter(`sgRNA Sequence` %in% cas12a_compare_guides$guide1)
+cas12a_target_designs <- cas12a_compare_designs %>%
+  filter((`Target Cut %` > 5) & (`Target Cut %` < 80) &
+           (`# Off-Target Tier I Match Bin I Matches` == 0) &
+           (`# Off-Target Tier I Match Bin II Matches` == 0) &
+           (`Target Gene Symbol` %in% compare_genes)) %>%
+  group_by(`Target Gene Symbol`) %>%
+  top_n(3, `enGB`)
+cas12a_target_designs %>%
+  group_by(`Target Gene Symbol`) %>%
+  summarise(n())
+```
+
+```{r}
+cas12a_target_designs <- cas12a_target_designs %>%
+  filter(`Target Gene Symbol` != 'MAP2K1')
+```
+
+```{r}
+cas12a_control_designs <- cas12a_compare_designs %>%
+  filter((`# Off-Target Tier I Match Bin I Matches` == 0) &
+           (`# Off-Target Tier I Match Bin II Matches` == 0) &
+           grepl('OR',`Target Gene Symbol`)) %>%
+  top_n(15, `enGB`)
+cas12a_control_designs %>%
+  group_by(`Target Gene Symbol`) %>%
+  nrow()
+```
+
+```{r}
+cas12a_compare_set <- cas12a_compare_guides %>%
+  filter(((guide1 %in% c(cas12a_control_designs$`sgRNA Sequence`))| 
+           (guide1 %in% c(cas12a_target_designs$`sgRNA Sequence`))) &
+           ((guide2 %in% c(cas12a_control_designs$`sgRNA Sequence`))| 
+           (guide2 %in% c(cas12a_target_designs$`sgRNA Sequence`))))
+```
+
+```{r}
+cas12a_compare_set %>%
+  filter(!(control1 | control2)) %>%
+  select(guide1, guide2, gene1, gene2) %>%
+  distinct() %>%
+  group_by(gene1, gene2) %>%
+  summarise(n()) 
+```
+
+```{r}
+cas12a_compare_set %>%
+  filter(control2) %>%
+  select(guide1, gene1, guide2) %>%
+  distinct() %>%
+  group_by(gene1) %>%
+  summarise(n()) 
+```
+
+```{r}
+cas12a_compare_set %>%
+  filter(control1) %>%
+  select(guide1, gene2, guide2) %>%
+  distinct() %>%
+  group_by(gene2) %>%
+  summarise(n()) 
+```
+
+## Filter Big Papi Data
+```{r}
+compare_genes_filtered <- setdiff(compare_genes,c('MAP2K1', 'MAP2K2', 'BCL2L2'))
+compare_pairs_filtered <- setdiff(compare_pairs, c("BCL2L1_BCL2L2", "MAP2K1_MAP2K2"))
+control_regex = '(CD81)|(HPRT intron)'
+bp_filtered <- bp_inputs %>%
+  select(sgRNA1:gene2,A375, OVCAR8) %>%
+  gather(assay, `Avg. LFC`, A375, OVCAR8) %>%
+  mutate(gene1 = word(gene1, 1, sep = '_'), 
+         gene2 = word(gene2, 1, sep = '_'),
+         pair = ifelse(gene1 < gene2,
+                       paste(gene1, gene2, sep = '_'),
+                       paste(gene2, gene1, sep = '_')), 
+         control1 = grepl(control_regex, gene1), 
+         control2 = grepl(control_regex, gene2)) %>%
+  filter((gene1 %in% compare_genes_filtered & control2) |
+           (gene2 %in% compare_genes_filtered & control1) |
+           (pair %in% compare_pairs_filtered) |
+           (control1 & control2))
+bp_filtered %>%
+  filter(!(control1 | control2)) %>%
+  select(sgRNA1, sgRNA2, gene1, gene2) %>%
+  distinct() %>%
+  group_by(gene1, gene2) %>%
+  summarise(n()) 
+```
+
+```{r}
+bp_filtered %>%
+  filter(control2) %>%
+  select(sgRNA1, gene1, sgRNA2) %>%
+  distinct() %>%
+  group_by(gene1) %>%
+  summarise(n()) 
+```
+
+```{r}
+bp_filtered %>%
+  filter(control1) %>%
+  select(sgRNA1, gene2, sgRNA2) %>%
+  distinct() %>%
+  group_by(gene2) %>%
+  summarise(n()) 
+```
+
+## Comparison
+```{r}
+colnames(cas12a_compare_set)
+```
+
+```{r}
+colnames(bp_filtered)
+```
+
+```{r}
+compare_set <- bind_rows(
+  cas12a_compare_set %>%
+    select(-c(`Construct Barcode`,DR, A, B, density, DR_name)) %>%
+    mutate(system = 'enCas12a'),
+  bp_filtered %>%
+    rename(guide1 = sgRNA1, guide2 = sgRNA2) %>%
+    mutate(system = 'Big Papi')
+)
+```
+
+```{r}
+guide1_base_lfcs_comp <- compare_set %>%
+  filter(control2) %>%
+  group_by(guide1, gene1, assay, system) %>%
+  summarise(`Base LFC 1` = mean(`Avg. LFC`))
+guide2_base_lfcs_comp <- compare_set %>%
+  filter(control1) %>%
+  group_by(guide2, gene2, assay, system) %>%
+  summarise(`Base LFC 2` = mean(`Avg. LFC`))
+compare_base_lfcs <- compare_set %>%
+  inner_join(guide1_base_lfcs_comp) %>%
+  inner_join(guide2_base_lfcs_comp) 
+compare_residuals <- get_guide_residuals(compare_base_lfcs, type = 'system') %>%
+  mutate(Type = ifelse(control1 | control2, 'Control', 'Target'))
+```
+
+```{r}
+control_distributions <- compare_residuals %>%
+  filter(Type == 'Control') %>%
+  group_by(system, assay) %>%
+  summarise(control_mean = mean(Residual), control_sd = sd(Residual))
+```
+
+
+```{r}
+max_y_range <- max(compare_residuals$Residual) - min(compare_residuals$Residual)
+for (curr_pair in unique(unlist(compare_residuals[!(compare_residuals$control1 | compare_residuals$control2), 'pair']))) {
+  for (curr_cell in unique(compare_residuals$assay)) {
+    genes = word(curr_pair, 1:2, sep = '_')
+    current_residuals <- compare_residuals %>%
+      filter(pair == curr_pair | (control1 & (gene2 %in% genes)) | 
+               (control2 & (gene1 %in% genes)), 
+             assay == curr_cell) 
+    stat_test <- current_residuals %>%
+      group_by(system) %>%
+      nest() %>%
+      mutate(
+        spread = map(data, function(df) t.test(df$Residual[df$Type == 'Control'],
+                                                    df$Residual[df$Type == 'Target'], 
+                                                    alternative = 'greater')), 
+        tidied = map(spread, tidy)
+      ) %>%
+      unnest(tidied, .drop = TRUE)
+    dotsize = (max(current_residuals$Residual) - min(current_residuals$Residual))/max_y_range
+    ggplot(current_residuals) +
+      aes(x = system, y = Residual, fill = Type) +
+      geom_hline(yintercept = 0, linetype = 'dashed') +
+      geom_boxplot(outlier.size = 0.5) +
+      geom_dotplot(aes(alpha = Type), position = position_dodge(width = 0.75), 
+                   binaxis = 'y', stackdir = 'center', binwidth = 0.05, 
+                   dotsize = 2*dotsize, show.legend = F) +
+      scale_alpha_manual(values = c(0,1)) +
+      ggtitle(paste0(paste(genes, collapse = '/'), ' ', curr_cell)) +
+      geom_text(data = stat_test, aes(label = paste0('p=',signif(p.value, 2)), 
+                               y = Inf, vjust = 1, fill = NULL), 
+                size = 2.83) +
+      theme_minimal() +
+      theme_manuscript() +
+      theme(legend.key.size = unit(0.3, 'cm'), 
+            legend.position = 'top',
+            legend.title = element_blank(), 
+            legend.box.margin = margin(0,0,0,0, unit = 'cm'), 
+            legend.margin = margin(0,0,0,0, unit = 'cm'),
+            legend.text = element_text(size = 8),
+            axis.text.x = element_text(size = 8)) + 
+      xlab('') +
+      ylab('') +
+      scale_fill_brewer(palette = 'Set1') 
+    ggsave(here('figures','synlet','system_comparison', paste0(curr_pair, '_',
+                                                               curr_cell, '.svg')), 
+           width = 4.5, height = 6, units = 'cm')
+  }
+}
+```
+
+
+
+```{r}
+x_y_comparison <- compare_residuals %>%
+  filter(!(control1 | control2)) %>%
+  group_by(assay, system, pair) %>%
+  summarise(`Avg. Residual` = mean(Residual)) %>%
+  spread(system, `Avg. Residual`) %>%
+  rename('Big Papi (Avg. Residual)' = 'Big Papi', 
+         'enCas12a (Avg. Residual)' = 'enCas12a') %>%
+  rename(`Cell Line` = assay) %>%
+  mutate(pair = str_replace(pair, '_', '/'))
+```
+
+```{r}
+en_bp_cor <- ggplot(x_y_comparison) +
+  aes(x = `Big Papi (Avg. Residual)`, y = `enCas12a (Avg. Residual)`) +
+  geom_smooth(method = 'lm', se = FALSE, color = 'darkgrey') +
+  geom_point(aes(shape = pair,
+      color = `Cell Line`)) +
+  theme_classic() +
+  theme_manuscript() +
+  theme(legend.spacing.y = unit(2, 'pt'),
+        aspect.ratio = 1) +
+  stat_cor(aes(label = ..r.label..), method = 'spearman', size = 2.83) +
+  scale_color_manual(values = c('#4878d0', '#ee854a'))
+en_bp_cor
+ggsave(here('figures','synlet','en_bp_cor.svg'),en_bp_cor, width = 9, height = 6, units = 'cm')
+```
+

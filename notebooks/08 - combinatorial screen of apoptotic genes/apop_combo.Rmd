@@ -1,0 +1,173 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(intactr)
+library(tidyverse)
+library(ggExtra)
+library(here)
+
+theme_manuscript <- function() {
+    theme(text = element_text(size = 8, family = 'Arial'), 
+          aspect.ratio = 1,
+          legend.box.margin = margin(t = 2, r = 2, b = 2, l = 2),
+          legend.box.spacing = unit(2,'pt'), 
+          legend.key.size = unit(10, 'pt'), 
+          legend.title = element_text(size = 9),
+          plot.title = element_text(size = 9, hjust = 0.5), 
+          strip.text = element_text(size = 8),
+          legend.text = element_text(size = 8))
+}
+```
+
+```{r}
+lfcs <- apop_combo_lfcs %>%
+  rename(A375 = `A375|RDA_174|no drug|NA`, 
+         OVCAR8 = `OVCAR8|RDA_174|no drug|NA`)
+plot_data <- intactr::plot_combo_residuals('BCL2L1', 'MCL1',lfcs, 10)
+guide_residuals <- plot_data$plot_data %>%
+  filter(guide == 1,
+         context == 'A375', 
+         gene1 == 'MCL1') %>%
+  mutate(guide_number = paste('guide', guide), 
+         `Pair` = fct_recode(target, 'target' = 'other'))
+ggplot(guide_residuals) +
+  aes(x = base_lfc2, y = avg_lfc, color = `Pair`) +
+  geom_point(pch = 16) +
+  scale_color_manual(values = c('#e41a1c', '#377eb8', 'grey', 'black')) +
+  geom_smooth(method = 'lm', color = 'white', size = 0.5) +
+  theme_minimal() +
+  theme_manuscript() +
+  theme(legend.position = 'top') +
+  guides(color = guide_legend(nrow = 2)) +
+  xlab('base_lfc') +
+  facet_wrap(c('context', 'gene1', 'guide_number'), 
+             labeller = label_wrap_gen(multi_line=FALSE),
+             nrow = 2, scales = 'free_y') +
+  xlab('Target Guide Median LFC\nWith Controls') +
+  ylab('Construct Avg. LFC') 
+ggsave(here('figures','apop', 'MCL1_residual_example.svg'), width = 6, height = 7, units = 'cm')
+```
+
+
+```{r}
+combo_scores <- calculate_anchor_residuals(lfcs, 10)
+cutoff <- -10
+label_pairs <- c('BCL2L1:MCL1', 'MARCH5:WSB2', 'MCL1:WSB2', 'BCL2L1:MARCH5',
+                 'BAX:BCL2L1', 'BCL2L1:PMAIP1')
+spread_scores <- combo_scores %>%
+  pivot_wider(names_from = context, values_from = combo_z_score) %>%
+  mutate(type = if_else(grepl('ctl', genes), 'control', 
+                        if_else(geneA == geneB, 'same gene', 'target pair'))) %>%
+  arrange(desc(type)) %>%
+  mutate(label = if_else(genes %in% label_pairs, genes, '')) 
+                         
+ggplot(spread_scores) +
+  aes(x = A375, y = OVCAR8, color = type) +
+  geom_point(pch = 16) +
+  theme_minimal() +
+  theme_manuscript() +
+  theme(legend.position = 'top', 
+        legend.margin = margin(2,2,2,2),
+        plot.title = element_text(size = 9, margin = margin(2,2,2,2))) +
+  coord_equal() +
+  scale_color_manual(values = c('grey', '#a6cee3', 'black')) +
+  ggpubr::stat_cor(aes(label = ..r.label.., color = NULL),
+                   show.legend = F, size = 2.83, family = 'Arial') +
+  ggrepel::geom_text_repel(aes(label = label), show.legend = F, 
+                           size = 2.83,  
+                           min.segment.length = 0, color = '#e31a1c',
+                           segment.color = '#fb9a99',
+                           box.padding = 0.25, family = 'Arial') +
+  ggtitle('Residual Z-score')
+ggsave(here('figures', 'apop', 'cell_comparison.svg'), width = 7.5, height = 7.5, 
+       units = 'cm')
+```
+
+```{r}
+mcl1_anchor_scores <- read_csv(here('data', 'external', 'mcl1_anchor_hits.csv'))
+bcl2l1_anchor_scores <- read_csv(here('data', 'external', 'bcl2l1_anchor_hits.csv'))
+bound_anchor_scores <- bind_rows(mcl1_anchor_scores %>%
+                                   mutate(genes = if_else(`Gene Symbol` < 'MCL1', 
+                                                          paste(`Gene Symbol`, 'MCL1', sep = ':'),
+                                                          paste('MCL1', `Gene Symbol`, sep = ':')), 
+                                          anchor = 'MCL1'),
+                                 bcl2l1_anchor_scores %>%
+                                   mutate(genes = if_else(`Gene Symbol` < 'BCL2L1', 
+                                                          paste(`Gene Symbol`, 'BCL2L1', sep = ':'),
+                                                          paste('BCL2L1', `Gene Symbol`, sep = ':')),
+                                          anchor = 'BCL2L1'))
+apop_combo_anchor <- inner_join(combo_scores, bound_anchor_scores %>% 
+                                  select(genes, `genetic avg z-score`, `drug avg z-score`, anchor) %>%
+                                  rename(`Anchor Guide` = `genetic avg z-score`, 
+                                         `Small Molecule` = `drug avg z-score`)) %>%
+  pivot_longer(cols = c('Anchor Guide', 'Small Molecule'), names_to = 'anchor_condition', 
+               values_to = 'Anchor Screen (Avg. Z-score)') 
+ggplot(apop_combo_anchor) +
+  aes(x = `Anchor Screen (Avg. Z-score)`, y = combo_z_score) +
+  geom_point(aes(color = anchor)) +
+  theme_minimal() +
+  theme_manuscript() +
+  theme(panel.spacing = unit(0.4, 'cm')) +
+  ggpubr::stat_cor(aes(label = ..r.label..), 
+                   size = 2.83) +
+  facet_grid(cols = vars(context), rows = vars(anchor_condition)) +
+  ylab('Combinatorial Screen (Z-score)') +
+  scale_color_manual(values = c('#e41a1c', '#377eb8'))
+ggsave(here('figures', 'apop', 'anchor_comparison.svg'), width = 12, height = 12, 
+       units = 'cm')
+``` 
+
+
+```{r}
+cutoff <- 5
+score <- 'combo_z_score'
+signif_combos <- combo_scores %>% filter(abs(!!as.name(score)) > 
+        cutoff, geneA != geneB)
+combo_graph <- signif_combos %>% select(geneA, geneB, combo_z_score, 
+    context) %>% tidygraph::as_tbl_graph()
+ggraph::ggraph(combo_graph, layout = "stress", bbox = 3) + 
+  ggraph::geom_edge_link(aes(color = !!as.name(score), 
+                             width = abs(!!as.name(score)))) + 
+  ggraph::scale_edge_width(range = c(1, 2.5)) + 
+  ggraph::geom_node_label(aes(label = name), size = 2.83,
+                          repel = T, point.padding = 0, label.padding = 0.1, 
+                          min.segment.length = 0.1, box.padding = 0.1) + 
+  theme_void() + 
+  theme_manuscript() +
+  theme(panel.spacing = unit(0.4, 'cm')) + 
+  ggraph::scale_edge_color_gradient2() + 
+  guides(edge_width = FALSE, 
+         edge_colour = ggraph::guide_edge_colourbar(title = 'Z-score', barwidth = 0.5)) +
+  ggraph::facet_edges("context")
+ggsave(here('figures', 'apop', 'network.svg'), width = 10, height = 6, 
+       units = 'cm')
+```
+
+```{r}
+data_p <- plot_combo('MARCH5', 'WSB2', lfcs)
+data_p$p +
+  theme_minimal() +
+  theme_manuscript() +
+  theme(legend.position = 'top',
+        axis.text.x = element_blank()) +
+  ylab('Avg. LFC') +
+  guides(color = guide_legend(nrow = 2)) +
+  scale_color_manual(values = c('black','#66c2a5', '#fc8d62', '#8da0cb'))
+ggsave(here('figures', 'apop', 'MARCH5_WSB2.svg'), width = 9, height = 5.5, units = 'cm')
+```
+
+```{r}
+apop_avg_lfcs <- intactr::average_gene_scores(lfcs, 10)
+combo_level_lfcs <- apop_avg_lfcs %>%
+  select(-gene_lfcA, -gene_lfcB) %>%
+  pivot_wider(names_from = 'context', values_from = 'avg_lfc')
+cor.test(combo_level_lfcs$A375,
+         combo_level_lfcs$OVCAR8)
+```
+
+```{r}
+cor.test(spread_scores$A375, spread_scores$OVCAR8)
+```
+

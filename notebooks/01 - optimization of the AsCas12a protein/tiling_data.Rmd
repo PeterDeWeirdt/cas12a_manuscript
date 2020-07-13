@@ -1,0 +1,303 @@
+---
+title: "Tiling data"
+---
+
+This notebook is for the first section of the Cas12a manuscript: otpimization of the AsCas12a protein
+
+# Setup and data exploration
+
+```{r}
+library(tidyverse)
+library(here)
+library(AUC)
+library(broom)
+extrafont::loadfonts() 
+```
+
+```{r}
+rda_085_data <- read_csv(here('data','interim','RDA_085_LFC.csv'))
+rda_112_data <- read_csv(here('data','interim','RDA_112_LFC.csv'))
+rda_113_data <- read_csv(here('data','interim','RDA_113_LFC.csv'))
+rda_174_data <- read_csv(here('data','interim','RDA_174_LFC.csv'))
+gene_cell_conditions <- read_csv(here('data','raw','gene_cell_conditions.csv'))
+cas12a_context_sequences <- read_csv(here('data', 'external', 'cpf1_tile_sgrna_context.csv'))
+```
+
+# Replicate Correlations
+```{r}
+all_cas12a <- reduce(list(rda_112_data, rda_113_data, rda_174_data), inner_join) %>%
+  separate(`Construct IDs`, sep = ';', into = c('guide', 'Gene'))
+rep_spread_cas12a <- all_cas12a %>%
+  gather(treatment, LFC, `MelJuSo|RDA_112|no drug|N/A|pDNA|A|LFC`:`A375|RDA_174|6TG|NA|no drug|B|LFC`) %>%
+  separate(treatment, sep = '\\|', into = c('Cell', 'RDA', 'Condition', 'dose','from', 'Rep', 'Measure')) %>%
+  spread(Rep, LFC) %>%
+  mutate(Avg.LFC = (A+B)/2) %>%
+  mutate(`20mer` = substr(guide, 1, 20), 
+         construct = fct_recode(RDA, 'enCas12a' = 'RDA_174', 
+                                '2xNLS-Cas12a' = 'RDA_112', 
+                                '1xNLS-Cas12a' = 'RDA_113'), 
+         construct = factor(construct, levels = c('enCas12a','2xNLS-Cas12a','1xNLS-Cas12a'))) %>%
+  inner_join(cas12a_context_sequences %>% mutate(`20mer` = substr(`Guide Sequence`, 1, 20))) %>%
+  mutate(PAM = substr(`Context Sequence`, 5, 8))
+expected_phenos_cas12a <- rep_spread_cas12a %>%
+  inner_join(gene_cell_conditions)
+cas12a_cors <- expected_phenos_cas12a %>%
+  group_by_at(vars(Cell:Measure))%>%
+  summarise(cor(A,B), 
+            n())
+cas12a_cors
+```
+
+```{r}
+all_cas9 <- rda_085_data %>%
+  separate(`Construct IDs`, sep = ';', into = c('guide', 'Gene'))
+rep_spread_cas9 <- all_cas9 %>%
+  gather(treatment, LFC, `A375|RDA_085|no drug|NA|pDNA|A|LFC`:`A375|RDA_085|no drug|NA|pDNA|B|LFC`) %>%
+  separate(treatment, sep = '\\|', into = c('Cell', 'RDA', 'Condition', 'dose','from', 'Rep', 'Measure')) %>%
+  spread(Rep, LFC) %>%
+  mutate(Avg.LFC = (A+B)/2)
+expected_phenos_cas9 <- rep_spread_cas9 %>%
+  inner_join(gene_cell_conditions)
+cas9_cors <- expected_phenos_cas9 %>%
+  group_by_at(vars(Cell:Measure))%>%
+  summarise(cor(A,B), 
+            n())
+cas9_cors
+```
+
+# Length
+
+```{r}
+flow_genes <- c('CD81', 'CD33', 'FAS', 'ICAM1')
+a375_cas12a_essentials <- expected_phenos_cas12a %>%
+  filter(Cell == 'A375', Condition == 'no drug') %>%
+  mutate(Essential = TRUE)
+a375_cas12a_flow <- rep_spread_cas12a %>%
+  filter(Cell == 'A375', Condition == 'no drug',Gene %in% flow_genes) %>%
+  mutate(Essential = FALSE)
+cas12a_essentiality_cutoffs <- a375_cas12a_flow %>%
+  group_by(construct) %>%
+  summarise(cutoff = quantile(Avg.LFC, 0.05))
+length_df <- a375_cas12a_essentials %>%
+  mutate(Length = as.character(Length)) %>%
+  bind_rows(a375_cas12a_flow %>% mutate(Length = 'Control'))
+length_active <- length_df %>%
+  inner_join(cas12a_essentiality_cutoffs) %>%
+  mutate(active = Avg.LFC < cutoff) %>%
+  group_by(Length, construct) %>%
+  summarise(fraction_active = sum(active)/n()) %>%
+  mutate(percent_active = paste0(round(fraction_active,2)*100, '%'))
+ggplot(length_df) +
+  aes(y = Avg.LFC, x = Length, fill = Length) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        plot.title = element_text(size = 10, face = 'bold'), 
+        legend.key.size = unit(0.5, 'cm')) +
+  geom_boxplot() +
+  geom_hline(data = cas12a_essentiality_cutoffs, aes(yintercept = cutoff), linetype = 'dashed') +
+  geom_label(data = length_active, aes(label = percent_active), y = -Inf, vjust = 0, 
+             label.padding = unit(0.05, 'cm'), alpha = 0.8, size = 3) +
+  facet_wrap('construct') +
+  xlab('') + 
+  ylab('Avg. LFC') +
+  scale_fill_manual(values = c('#eff3ff', '#bdd7e7', '#6baed6', '#3182bd', 'grey')) +
+  ggtitle('A375 Essential Guides') +
+  guides(fill = FALSE) +
+  xlab('Length')
+ggsave(here('figures','tiling', 'length_box.pdf'), width = 18, height = 6, 
+       units = 'cm', device = cairo_pdf)
+```
+
+# PAM
+
+```{r}
+pam_df <- a375_cas12a_essentials %>%
+  bind_rows(a375_cas12a_flow %>% mutate(PAM = 'Control')) %>%
+  mutate(PAM = factor(PAM, levels = c('TTTA','TTTC','TTTG','TTTT','Control')))
+pam_active <- pam_df %>%
+  inner_join(cas12a_essentiality_cutoffs) %>%
+  mutate(active = Avg.LFC < cutoff) %>%
+  group_by(PAM, construct) %>%
+  summarise(fraction_active = sum(active)/n()) %>%
+  mutate(percent_active = paste0(round(fraction_active,2)*100, '%'))
+ggplot(pam_df) +
+  aes(y = Avg.LFC, x = PAM, fill = PAM) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        plot.title = element_text(size = 10, face = 'bold'), 
+        legend.key.size = unit(0.5, 'cm')) +
+  geom_boxplot() +
+  geom_hline(data = cas12a_essentiality_cutoffs, aes(yintercept = cutoff), linetype = 'dashed') +
+  geom_label(data = pam_active, aes(label = percent_active), y = -Inf, vjust = 0, 
+             label.padding = unit(0.05, 'cm'), alpha = 0.8, size = 3) +
+  facet_wrap('construct') +
+  xlab('') + 
+  ylab('Avg. LFC') +
+  scale_fill_manual(values = c('#4878d0', '#ee854a', '#6acc64', '#d65f5f', 'grey')) +
+  ggtitle('A375 Essential Guides') +
+  guides(fill = FALSE) +
+  xlab('PAM')
+ggsave(here('figures','tiling', 'pam_box.pdf'), width = 18, height = 6, 
+       units = 'cm', device = cairo_pdf)
+```
+
+# AUCs
+
+```{r}
+a375_cas9_essentials <- expected_phenos_cas9 %>%
+  filter(Cell == 'A375', Condition == 'no drug') %>%
+  mutate(Essential = TRUE)
+a375_cas9_flow <- rep_spread_cas9 %>%
+  filter(Cell == 'A375', Condition == 'no drug', Gene %in% flow_genes) %>%
+  mutate(Essential = FALSE)
+
+bounded_auc_df <- bind_rows(a375_cas9_essentials, a375_cas9_flow, 
+                          a375_cas12a_essentials %>% filter(PAM != 'TTTT'), 
+                          a375_cas12a_flow %>% filter(PAM != 'TTTT')) %>%
+         mutate(Essential = as.factor(Essential))
+nested_rocs <- bounded_auc_df %>%
+  group_by_at(vars(Cell:Measure)) %>%
+  nest() %>%
+  mutate(roc = map(data, function(df) roc(-df$Avg.LFC, df$Essential)), 
+         tidied = map(roc, tidy), 
+         auc = map(roc, auc))
+aucs <- nested_rocs %>% unnest(auc, .drop = TRUE)
+roc_curves <- nested_rocs %>% unnest(tidied)
+ggplot(roc_curves) +
+  aes(x = fpr, y = tpr, color = RDA) +
+  geom_line(size = 0.75) +
+  coord_equal() +
+  scale_color_brewer(palette = 'Set1') +
+  theme_classic()
+```
+
+```{r}
+aucs
+```
+
+```{r}
+bounded_auc_df %>%
+  group_by(Essential, RDA) %>%
+  summarise(n())
+```
+
+# Guides across cell lines
+
+```{r}
+count(expected_phenos_cas12a, Condition, dose, from, Measure)
+```
+
+```{r}
+dropout_2x <- expected_phenos_cas12a %>%
+  filter(Condition == 'no drug') %>%
+  select(-c(A, B, dose)) %>%
+  spread(Cell, Avg.LFC) %>%
+  drop_na() %>%
+  gather(Cell, Avg.LFC, `786-O`:`OVCAR-8`) %>%
+  select(`Construct Barcode`, Gene, Cell, Avg.LFC)
+duplicate_lfcs <- inner_join(dropout_2x, dropout_2x, by = c('Construct Barcode', 'Gene')) %>%
+  filter(Cell.y < Cell.x)
+```
+
+```{r}
+lognorm <- function(v) {
+  return(log2(((v/sum(v))*1000000) + 1))
+}
+```
+
+
+```{r}
+library(corrr)
+reads <- c('cas12a2x_pdna1.csv', 'cas12a2x_pdna2.csv')
+lfcs <- list()
+for (i in 1:length(reads)) {
+  curr_reads <- reads[i]
+  print(curr_reads)
+  lognorm_df <- read_csv(here('data', 'supplementary_reads', curr_reads), skip = 5) %>%
+    pivot_longer(-(`Construct Barcode`:pDNA), names_to = 'condition', values_to = 'reads') %>%
+    separate(condition, c('Construct', 'Cell Line', 'Drug Arm', 'Replicate'), sep = ';') %>%
+    group_by_at(vars(Construct:`Drug Arm`)) %>%
+    mutate(lognorm = lognorm(reads), 
+           pdna_lognorm = lognorm(pDNA)) %>%
+    ungroup()
+  dropout_lognorms <- lognorm_df %>%
+    filter(`Drug Arm` == 'Dropout') 
+  dropout_lfcs <- dropout_lognorms %>%
+    mutate(lfc = lognorm - pdna_lognorm) 
+  avg_lfcs <- dropout_lfcs %>%
+    group_by_at(vars(`Construct Barcode`:`Drug Arm`)) %>%
+    summarise(avg_lfc = mean(lfc)) %>%
+    ungroup() %>%
+    mutate(read = curr_reads)
+  lfcs[[curr_reads]] <- avg_lfcs
+}
+spread_lfcs <- bind_rows(lfcs) %>%
+  filter(`Gene ID` %in% c('EEF2', 'HNRNPU', 'PELP1', 'TFRC', 'SF3B1', 'PSMA6', 
+                          'KPNB1', 'SNRPD1', 'RPS20', 'POLR1C')) %>%
+  mutate(`Cell Line` = if_else(`Cell Line` == 'MELJUSO', 
+                               if_else(read == 'cas12a2x_pdna1.csv',
+                                       'MELJUSO_1', 'MELJUSO_2'), `Cell Line`)) %>%
+  select(-pDNA, -read) %>%
+  pivot_wider(names_from = 'Cell Line', values_from = 'avg_lfc')
+lfc_cors <- spread_lfcs %>%
+  select(-c(`Construct Barcode`, `Gene ID`, Construct, `Drug Arm`)) %>%
+  correlate() %>%
+  stretch() %>%
+  filter(y > x) %>%
+  mutate(Pearson = r)
+```
+
+```{r}
+ggplot(lfc_cors) +
+  aes(x = x, y = y) +
+  geom_point(aes(size = Pearson, color = Pearson)) +
+  geom_text(aes(label = signif(Pearson, 2)), size = 2.5, color = 'white') +
+  scale_size_continuous(breaks = c(0,0.2,0.4,0.6,0.8,1), limits = c(0,1), 
+                        range = c(1,8)) +
+  scale_color_gradient2() +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 8, color = 'black', family = 'Arial'), 
+        aspect.ratio = 1, legend.position = 'none', 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  xlab('') +
+  ylab('') 
+ggsave(here('figures','tiling','essential_cors.pdf'), width = 7, height = 7, 
+       units = 'cm', device = cairo_pdf)
+```
+
+
+```{r}
+cell_x = 'A549'
+cell_y = 'A375'
+ggplot(spread_lfcs) +
+  aes(x = !!as.name(cell_x), y = !!as.name(cell_y)) +
+  geom_point(alpha = 0.4, size = 0.5) + 
+  theme_classic() +
+  theme(axis.text = element_text(color = 'black'), 
+        text = element_text(size = 10, family = 'Arial'),
+        aspect.ratio = 1, legend.position = 'none') +
+  geom_density2d(size = 0.25) +
+  xlab(paste(cell_x, '(Avg. LFC)')) +
+  ylab(paste(cell_y, '(Avg. LFC)'))
+ggsave(here('figures','tiling','a375_v_a549_lfc.pdf'), width = 5, height = 5, units = 'cm', 
+       device = cairo_pdf)
+```
+
+# Output Data
+```{r}
+write_csv(rep_spread_cas12a, here('data','interim','cas12a_spread_context.csv'))
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+

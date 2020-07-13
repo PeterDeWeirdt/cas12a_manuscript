@@ -1,0 +1,196 @@
+---
+title: "PAM_tiling filtering"
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(broom)
+source(here('R/filter_functions.R'))
+```
+
+```{r}
+tiling <- read_csv(here('data/reads/encas12a_pam_tiling.csv'), skip = 5)
+tiling_lfcs <- calculate_lfc(tiling, 'RDA_174;A375;PAM_Tiling;Dropout;Rep A',
+                             'RDA_174;A375;PAM_Tiling;Dropout;Rep B')
+plot_replicate_lfcs(tiling_lfcs)
+```
+
+```{r}
+cutoff <- tiling_lfcs %>%
+  filter(Type == 'Non-essential') %>%
+  select(avg_lfc) %>%
+  unlist() %>%
+  quantile(0.05)
+essential_active <- tiling_lfcs %>%
+  filter(Type == 'Essential') %>%
+  mutate(active = avg_lfc < cutoff, 
+         Tier = if_else(PAM %in% c('TTTC', 'TTTG', 'TTTA'), 'TTTV', 
+                       if_else(Tier == 'Tier 4', 'No Tier', 
+                       Tier)),
+         Tier = factor(Tier, levels = c('TTTV', 'Tier 1', 'Tier 2', 
+                                        'Tier 3', 'No Tier'))) %>%
+  group_by(PAM) %>%
+  mutate(fraction_active = sum(active)/n()) %>%
+  ungroup() %>%
+  mutate(PAM = fct_reorder2(PAM, Tier, fraction_active))
+         
+ggplot(essential_active) +
+  aes(x = PAM, fill = active) +
+  geom_histogram(stat = 'count') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.position = 'top') +
+  guides(fill = guide_legend(reverse = T)) +
+  scale_fill_brewer(palette = 'Paired')
+```
+
+```{r}
+PAM_summaries <- essential_active %>%
+  group_by(PAM, Tier) %>%
+  summarise(`Fraction Active` = sum(active)/n()) %>%
+  mutate(type = 'PAM')
+Tier_summaries <- essential_active %>%
+  group_by(Tier) %>%
+  summarise(`Fraction Active` = sum(active)/n()) %>%
+  mutate(type = 'Tier')
+bound_summaries <- bind_rows(PAM_summaries, Tier_summaries)
+ggplot(bound_summaries) +
+  aes(x = Tier, y = `Fraction Active`) +
+  geom_point(aes(shape = type, color = type, size = type)) +
+  ggrepel::geom_text_repel(data = bound_summaries %>%
+                             filter(PAM %in% c('TTCC', 'ATTA', 'GTTA')), 
+                           aes(label = PAM), size = 2.83, nudge_x = 0.3, 
+                           min.segment.length = 0, 
+                           segment.size = 0.4,
+                           family = 'Arial') +
+  geom_point(aes(shape = type, color = type, size = type)) +
+  scale_size_manual(values = c(4, 1)) +
+  scale_shape_manual(values = c(95, 16)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.position = 'top', 
+        legend.title = element_blank(), 
+        axis.title.x = element_blank()) +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8), 
+        legend.position = 'top',
+        legend.key.size = unit(0.1, 'cm'),
+        legend.margin=margin(t=-0.1, r=0, b=-0.3, l=0, unit="cm")) +
+  guides(fill = guide_legend(reverse = T)) +
+  scale_color_manual(values = c('#b2df8a', '#33a02c')) +
+  geom_hline(yintercept = 0.05, linetype = 'dashed') +
+  ggtitle('enCas12a PAM tiling')
+ggsave(here('figures', 'PAM_activities.svg'), width = 6, height = 7, units = 'cm')
+```
+
+```{r}
+nts <- c('A', 'C', 'T', 'G')
+pams = vector(mode = 'character', 256)
+i = 1
+for (nt1 in nts) {
+  for (nt2 in nts) {
+    for (nt3 in nts) {
+      for (nt4 in nts) {
+        pams[i] = paste0(nt1, nt2, nt3, nt4)
+        i = i + 1
+      }
+    }
+  }
+}
+PAM_summaries
+null_df <- tibble(PAM = pams, Tier = 'No Tier')
+unique_null <- anti_join(null_df, PAM_summaries, by = 'PAM')
+all_PAM_summaries <- bind_rows(unique_null, PAM_summaries) %>%
+  mutate(weight = if_else(Tier == 'TTTV', 1, 
+                          if_else(Tier == 'No Tier', 0,
+                                  `Fraction Active`)))
+ggplot(all_PAM_summaries) +
+  aes(x = weight, y = `Fraction Active`) +
+  geom_point() +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+weight_df <- all_PAM_summaries %>%
+  select(PAM, Tier, weight) %>%
+  arrange(-weight)
+write_csv(weight_df, here('data', 'processed', 'enCas12a_PAM_weights_off_targ.csv'))
+```
+
+
+```{r}
+Tier_summaries
+```
+
+```{r}
+PAM_summaries
+```
+
+
+We'll keep essential genes which are significantly more depleted than controls
+
+```{r}
+control_lfcs <- tiling_lfcs %>%
+  filter(Type == 'Non-essential') %>%
+  select(avg_lfc) %>%
+  unlist() 
+essential_gene_summary <- tiling_lfcs %>%
+  filter(Type == 'Essential') %>%
+  group_by(`Gene Symbol`) %>%
+  filter(n() > 1) %>%
+  summarise(n = n(),
+            t_p = t.test(avg_lfc, control_lfcs, alternative = 'less')$p.value) %>%
+  mutate(t_p_adjust = p.adjust(t_p, method = 'bonferroni')) %>%
+  arrange(-t_p_adjust) %>%
+  filter(t_p_adjust < 0.00001)
+```
+
+```{r}
+model_df <- tiling_lfcs %>%
+  filter(`Gene Symbol` %in% essential_gene_summary$`Gene Symbol`) %>%
+  group_by(`Gene Symbol`) %>%
+  mutate(activity_rank = percent_rank(-avg_lfc), 
+         scaled_activity = robustly_scale(avg_lfc))
+ggplot(model_df) +
+  aes(x = activity_rank, y = avg_lfc, color = `Gene Symbol`) +
+  geom_line() +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+ggplot(model_df) +
+  aes(x = scaled_activity, y = activity_rank, color = `Gene Symbol`) +
+  geom_point() +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+ggplot(model_df) +
+  aes(x = scaled_activity, fill = `Gene Symbol`) +
+  geom_histogram(color = 'black') +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+genes <-  model_df %>%
+  select(`Gene Symbol`) %>%
+  distinct() %>%
+  unlist() %>%
+  as.character()
+set.seed(4)
+train_genes <- genes %>%
+  sample(0.8*length(genes))
+```
+
+```{r}
+train_df <- model_df %>%
+  filter(`Gene Symbol` %in% train_genes)
+write_csv(train_df, here('data', 'modeling_data', 
+               paste0(Sys.Date(), '_encas12a_pam_tiling_train.csv')))
+test_df <- model_df %>%
+  filter(!(`Gene Symbol` %in% train_genes))
+write_csv(test_df, here('data', 'modeling_data', 
+               paste0(Sys.Date(), '_encas12a_pam_tiling_test.csv')))
+```

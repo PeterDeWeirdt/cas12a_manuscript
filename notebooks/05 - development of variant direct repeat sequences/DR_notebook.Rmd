@@ -1,0 +1,141 @@
+---
+title: "DR Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(ggrepel)
+library(ggpubr)
+library(extrafont)
+loadfonts()
+library(ggrastr)
+library(ggridges)
+library(gridExtra)
+```
+
+```{r}
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+```
+
+
+```{r}
+direct_repeats <- read_csv(here('data','processed', 'alt_DR_lfcs.csv'))
+```
+
+```{r}
+orientation_drs <- direct_repeats %>%
+  gather(column, LFC, `BCL2L1_MCL1;RepA`:`MCL1_BCL2L1;RepB`) %>%
+  separate(column, c('Orientation', 'Replicate'), sep = ';') %>%
+  group_by_at(vars(-Replicate, -LFC)) %>%
+  summarise(`Avg. LFC` = mean(LFC)) %>%
+  spread(Orientation, `Avg. LFC`)
+wildtype_df = orientation_drs %>%
+  filter(Type == 'wildtype')
+BM_tolerance = wildtype_df$BCL2L1_MCL1 + 3*sd(orientation_drs$BCL2L1_MCL1)
+MB_tolerance = wildtype_df$MCL1_BCL2L1 + 3*sd(orientation_drs$MCL1_BCL2L1)
+orientation_drs$density <- get_density(orientation_drs$BCL2L1_MCL1, orientation_drs$MCL1_BCL2L1, n = 300)
+ggplot(orientation_drs) +
+  aes(x = BCL2L1_MCL1, y = MCL1_BCL2L1,color = density) +
+  geom_point_rast(size = 0.5, raster.width = 6, raster.height = 6) +
+  #stat_density_2d(geom = "density") +
+  theme_classic() +
+  theme(aspect.ratio = 1, text = element_text(size = 10, family = 'Arial'), 
+        legend.key.width = unit(0.3, 'cm'), legend.title = element_blank()) +
+  scale_color_viridis_c() +
+  geom_point(data = wildtype_df, color = 'black', pch = 23, size = 1.5, alpha = 1, fill = 'red') +
+  geom_text_repel(data = wildtype_df, aes(label = 'Wildtype DR'), color = 'black', 
+                  nudge_x = 2, nudge_y = -0.5, size = 3)+
+  xlab('BCL2L1-MCL1\nLog-2 Fold Change') +
+  ylab('MCL1-BCL2L1\nLog-2 Fold Change') +
+  stat_cor(aes(label = ..r.label..), size = 3) +
+  scale_fill_viridis_c()
+ggsave(here('figures','DR','DR_orientation.pdf'), width = 8, height = 8, units = 'cm', 
+       useDingbats = FALSE)
+```
+
+```{r}
+unique(orientation_drs$Type)
+recoded_drs <- orientation_drs %>%
+  ungroup() %>%
+  mutate(Type = fct_recode(Type, 'Variant' = 'test', 'Randomized'='random', 
+                           'Truncated' = 'intend-6T', 'Wildtype' = 'wildtype'),
+         test = !(Type %in% c('Randomized', 'Truncated')))
+```
+
+```{r}
+ggplot() +
+  aes(x = BCL2L1_MCL1) +
+  geom_density(data = recoded_drs %>%
+                 filter(Type != 'Wildtype'), alpha = 0.4, aes(fill = Type)) +
+  geom_vline(data = recoded_drs %>%
+             filter(Type == 'Wildtype') %>%
+             as_tibble(), aes(xintercept = BCL2L1_MCL1, 
+                                             color = Type)) +
+  ggtitle('RDA_127: BCL2L1-MCL1') +
+  theme_classic() +
+  theme(strip.text = element_blank(), 
+        strip.background = element_blank(), 
+        legend.text = element_text(size = 8), 
+        axis.text = element_text(size = 8, color = 'black'),
+        axis.title.x = element_text(size=8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8, hjust = 0.5), 
+        legend.title = element_blank(), 
+        legend.margin = margin(-0.5,-0.5,-0.5,-0.5), 
+        legend.box.margin = margin(-0.5,-0.5,-0.5,-0.5),
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.3, 'cm'), 
+        legend.position = 'top') +
+  facet_wrap('test', nrow = 2, scales = 'free_y') +
+  xlab('Log2-Fold Change') +
+  scale_color_manual(values = 'black') +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +
+  guides(fill = guide_legend(order = 1), 
+         linetype = guide_legend(order = 2)) +
+  ylab('Density')
+ggsave(here('figures','DR','control_drs_127.pdf'), width = 8, height = 8, units = 'cm')
+
+```
+
+```{r}
+ggplot() +
+  aes(x = MCL1_BCL2L1) +
+  geom_density(data = recoded_drs %>%
+                 filter(Type != 'Wildtype'), alpha = 0.4, aes(fill = Type)) +
+  geom_vline(data = recoded_drs %>%
+             filter(Type == 'Wildtype') %>%
+             as_tibble(), aes(xintercept = MCL1_BCL2L1, 
+                                             color = Type)) +
+  ggtitle('RDA_128: MCL1-BCL2L1') +
+  theme_classic() +
+  theme(strip.text = element_blank(), 
+        strip.background = element_blank(), 
+        legend.text = element_text(size = 8), 
+        axis.text = element_text(size = 8, color = 'black'),
+        axis.title.x = element_text(size=8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8, hjust = 0.5), 
+        legend.title = element_blank(), 
+        legend.margin = margin(-0.5,-0.5,-0.5,-0.5), 
+        legend.box.margin = margin(-0.5,-0.5,-0.5,-0.5),
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.3, 'cm'), 
+        legend.position = 'top') +
+  facet_wrap('test', nrow = 2, scales = 'free_y') +
+  xlab('Log2-Fold Change') +
+  scale_color_manual(values = 'black') +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +
+  guides(fill = guide_legend(order = 1), 
+         linetype = guide_legend(order = 2)) +
+  ylab('Density')
+ggsave(here('figures','DR','control_drs_128.pdf'), width = 8, height = 8, units = 'cm')
+```
+

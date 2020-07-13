@@ -1,0 +1,25 @@
+---
+title: "enCas12a guide availability"
+output: html_notebook
+---
+
+
+```{r}
+library(here)
+library(tidyverse)
+
+seq_cutoff <- 60
+enpam_cutoff <- 0.7
+```
+
+```{r}
+genome_wide_designs <- read_csv(here('data', 'external','enPAM_GB_designs.csv'), n_max = 100000)
+genome_wide_designs %>%
+  group_by(`Target Gene Symbol`) %>%
+  summarise(n_active = sum(enPAM_GB > enpam_cutoff)) %>%
+  ggplot() +
+  aes(x = n_active) +
+  geom_histogram(binwidth = 0.5) +
+  scale_x_log10()
+```
+

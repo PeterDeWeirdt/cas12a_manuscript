@@ -1,0 +1,60 @@
+---
+title: "Tiling Correlations"
+---
+
+```{r}
+library(here)
+library(tidyverse)
+
+lognorm <- function(v) {
+  return(log2(((v/sum(v))*1e6) + 1))
+}
+```
+
+```{r}
+gene_cell_conditions <- read_csv(here('data','raw','expected_hits.csv')) 
+reads <- c('cas9_a375.csv', 'cas9_meljuso_ht29.csv', 'cas12a.csv', 'cas12a2x_pdna1.csv',
+           'cas12a2x_pdna2.csv', 'encas12_a375.csv', 'encas12_meljuso_ht29.csv')
+correlations <- list()
+for (i in 1:length(reads)) {
+  curr_reads <- reads[i]
+  print(curr_reads)
+  lognorm_df <- read_csv(here('data', 'supplementary_reads', curr_reads), skip = 5) %>%
+    pivot_longer(-(`Construct Barcode`:pDNA), names_to = 'condition', values_to = 'reads') %>%
+    separate(condition, c('Construct', 'Cell Line', 'Drug Arm', 'Replicate'), sep = ';') %>%
+    group_by_at(vars(Construct:`Drug Arm`)) %>%
+    mutate(lognorm = lognorm(reads), 
+           pdna_lognorm = lognorm(pDNA)) %>%
+    ungroup()
+  dropout_lognorms <- lognorm_df %>%
+    filter(`Drug Arm` == 'Dropout') 
+  drug_lfcs <- inner_join(lognorm_df %>% filter(`Drug Arm` != 'Dropout'),
+             dropout_lognorms %>% select(-`Drug Arm`, -reads) %>% rename(dropout_lognorm = lognorm)) %>%
+    mutate(lfc = lognorm - dropout_lognorm)
+  dropout_lfcs <- dropout_lognorms %>%
+    mutate(lfc = lognorm - pdna_lognorm)
+  bound_lfcs <- bind_rows(drug_lfcs, dropout_lfcs) %>%
+    select(-reads, -lognorm, -pdna_lognorm, -dropout_lognorm) %>%
+    pivot_wider(names_from = Replicate, values_from = lfc) 
+  intended_lfcs <- bound_lfcs %>%
+    separate('Drug Arm', c('Drug','Dose'), sep = ' ') %>%
+    inner_join(gene_cell_conditions, by = c('Gene ID' = 'Gene',
+                                            'Cell Line' = 'Cell',
+                                            'Drug' = 'Condition')) 
+  cors <- intended_lfcs %>%
+    group_by_at(vars(Construct:Dose)) %>%
+    summarise(correlation = cor(`Rep A`, `Rep B`),
+              n = n())
+  correlations[[curr_reads]] <- cors
+}
+bound_correlations <- bind_rows(correlations)
+```
+
+```{r}
+bound_correlations
+```
+
+```{r}
+sessionInfo()
+```
+

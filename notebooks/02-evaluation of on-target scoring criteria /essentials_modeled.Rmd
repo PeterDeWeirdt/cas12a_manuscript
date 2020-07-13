@@ -1,0 +1,70 @@
+---
+title: "R Notebook"
+---
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(extrafont)
+library(cutr)
+loadfonts()
+rda_174_lfcs <- read_csv(here('data','interim',
+                              'RDA_174_LFC.csv')) %>%
+  separate(`Construct IDs`, c('Guide Sequence', 'Gene'), sep = ';')
+essential_genes <- c('EEF2','PELP1','HNRNPU','TFRC','SF3B1','PSMA6','KPNB1','SNRPD1','RPS20','POLR1C')
+essential_predictions <- read_tsv(here('data','external',
+                                  'deepcpf1_hacked_essential_output.txt')) %>%
+  filter(Gene %in% essential_genes)
+filtered_predictions <- essential_predictions %>%
+  filter(PAM == 'TTTT')
+```
+
+```{r}
+tttv_avg_predictions <- filtered_predictions %>%
+  filter(sequence_type %in% c('TTTA_sequence', 'TTTC_sequence', 'TTTG_sequence')) %>%
+  group_by_at(vars(`Context Sequence`:end_context)) %>%
+  summarise(`Seq-DeepCpf1 Score` = mean(`Seq-DeepCpf1 Score`))%>%
+  mutate(sequence_type = 'TTTV Avg.')
+expanded_predictions <- bind_rows(filtered_predictions, tttv_avg_predictions) %>%
+  filter(sequence_type != 'TTTT_sequence')
+
+hacked_correlations <- expanded_predictions %>%
+  group_by(sequence_type) %>%
+  summarise(correlation = cor(`Seq-DeepCpf1 Score`, `Avg_LFC`, method = 'spearman'), 
+            n = n()) %>%
+  mutate(sequence_type = word(sequence_type, 1, sep = '_'), 
+         sequence_type = fct_reorder(sequence_type, correlation, .fun = mean)) 
+
+ggplot(hacked_correlations) +
+  aes(y = correlation, x = sequence_type, fill = sequence_type, label = n) +
+  geom_bar(stat = 'identity', position = "dodge") +
+  theme_classic() +
+  scale_fill_manual(values = c('#a6d854', '#66c2a5','#fc8d62', '#e78ac3','#8da0cb')) +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        legend.position = 'top',
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.line.y = element_blank(),
+        legend.key.size = unit(0.3,'cm')) +
+  ylab('Correlation') +
+  coord_flip() +
+  ggtitle('enCas12a Essential Guides \nTTTT PAM') +
+  guides(fill = guide_legend(nrow = 3, title = 'hack', byrow = TRUE)) +
+  geom_hline(yintercept = 0)
+ggsave(here('figures','ML','hacked_essentials.pdf'), height = 8.5, width = 5.7, units = 'cm', 
+       device = cairo_pdf)
+```
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+

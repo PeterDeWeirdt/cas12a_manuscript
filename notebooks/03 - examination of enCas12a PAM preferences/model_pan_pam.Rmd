@@ -1,0 +1,438 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(reticulate)
+library(here)
+use_condaenv(condaenv = 'sgrna_modeler', required = T)
+import_from_path(module = 'sgrna_modeler', path = here())
+```
+
+```{python}
+import pandas as pd
+import sgrna_modeler.models as sg
+import sgrna_modeler.datasets as da
+import sgrna_modeler.enzymes as en
+
+def load_panpam_train():
+    data = pd.read_csv('../data/modeling_data/2019-12-17_encas12a_pam_tiling_train.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='activity_rank',
+                               name = 'enCas12a_PAM_tiling_train',
+                               type = 'train',
+                               group_column='Gene Symbol')
+    return data_class
+
+def load_panpam_test():
+    data = pd.read_csv('../data/modeling_data/2019-12-17_encas12a_pam_tiling_test.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='activity_rank',
+                               name = 'enCas12a_PAM_tiling_test',
+                               type = 'test',
+                               group_column='Gene Symbol')
+    return data_class
+
+
+def load_en_tiling_test():
+    data = pd.read_csv('../data/modeling_data/2019-12-17_A375_en_TTTN_tiling_drug.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='activity_rank',
+                               name = 'enCas12a_TTTN_tiling_test',
+                               type = 'test',
+                               group_column='Gene ID')
+    return data_class
+
+def load_2x_tiling_train():
+    data = pd.read_csv('../data/modeling_data/2019-12-17_A375_2x_TTTN_tiling_nodrug.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='activity_rank',
+                               name = '2xCas12a_TTTN_tiling_train',
+                               type = 'train',
+                               group_column='Gene ID')
+    return data_class
+
+def load_2x_tiling_test():
+    data = pd.read_csv('../data/modeling_data/2019-12-17_A375_2x_TTTN_tiling_drug.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='activity_rank',
+                               name = '2xCas12a_TTTN_tiling_test',
+                               type = 'test',
+                               group_column='Gene ID')
+    return data_class
+
+def load_deepcpf1_test():
+    data = pd.read_csv('../data/modeling_data/Kim_2018_Test.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='Indel frequency',
+                               name = 'Kim_2018_test',
+                               type = 'test',
+                               group_column='')
+    return data_class
+def load_deepcpf1_train():
+    data = pd.read_csv('../data/modeling_data/Kim_2018_Train.csv')
+    data_class = da.Activity_Data(data = data, enzyme = en.cas12a, kmer_column='Context Sequence',
+                               activity_column='Indel frequency',
+                               name = 'Kim_2018_train',
+                               type = 'train',
+                               group_column='')
+    return data_class
+```
+
+```{python}
+from copy import deepcopy
+
+models = [sg.Model_Doench2016(), sg.Model_Kim2018()]
+train_datum = [load_panpam_train(), load_2x_tiling_train(),load_deepcpf1_train()]
+test_datum = [load_panpam_test(), load_2x_tiling_test(), load_en_tiling_test(), load_deepcpf1_test()]
+predictions = []
+trained_models = {}
+for model in models:
+    print(model.base_name)
+    for train_data in train_datum:
+        print('\t' + train_data.name)
+        train_model = deepcopy(model)
+        train_model.fit(train_data)
+        trained_models[model.base_name + ':' + train_data.name] = train_model
+        for test_data in test_datum:
+            print('\t\t' + test_data.name)
+            predicted_test_data = train_model.predict(test_data)
+            predictions.append(predicted_test_data)
+
+all_predictions = pd.concat(predictions)
+
+```
+
+```{python}
+all_predictions = all_predictions[~((all_predictions.training_data == 'D_Kim_2018_train') & (all_predictions.model == 'M_Kim_2018'))]
+deepcpf1 = sg.Model_Kim2018()
+deepcpf1.load_weights('../data/model_weights/Seq_deepCpf1_weights_tf.h5', load_deepcpf1_train())
+deepcpf1_predictions = []
+for test_data in test_datum:
+  print('\t\t' + test_data.name)
+  predicted_test_data = deepcpf1.predict(test_data)
+  deepcpf1_predictions.append(predicted_test_data)
+bound_deepcpf1_predictions = pd.concat(deepcpf1_predictions)
+all_predictions_deep = pd.concat([all_predictions, bound_deepcpf1_predictions])
+```
+
+
+```{r}
+library(tidyverse)
+library(here)
+raw_predictions <- py$all_predictions_deep %>% as_tibble()
+group_summarised_cors <- raw_predictions %>%
+  group_by(group, model, training_data, test_data) %>%
+  summarise(spearman = cor(y, prediction, method = 'spearman')) 
+```
+
+# deepcpf1 > gradient boosting
+
+```{r}
+tttn_2x_test <- group_summarised_cors %>%
+  filter(test_data == 'D_2xCas12a_TTTN_tiling_test') %>%
+  ungroup() %>%
+  mutate(model = fct_reorder(model, spearman, .fun = mean), 
+         training_data = fct_reorder(training_data, spearman, .fun = mean)) %>%
+  drop_na() %>%
+  rename(Gene = group)
+```
+
+
+```{r}
+ggplot(tttn_2x_test) +
+  aes(x = training_data, y = spearman, color = model, shape = Gene, group = model) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  scale_color_brewer(palette = 'Set2') +
+  ylab('Average Spearman Correlation') +
+  xlab('Training Data')
+```
+
+
+# pam tiling predictions are GOOD
+
+```{r, fig.width=3.2, fig.height=2.15}
+hacked_scores_pan_pam <- read_tsv(here('data', 'predictions', 'pam_tiling_designs.txt'))
+minimal_hacked_scores <- hacked_scores_pan_pam %>%
+  select(`sgRNA Context Sequence`, `On-Target Efficacy Score`) %>%
+  rename(kmer = `sgRNA Context Sequence`, prediction = `On-Target Efficacy Score`) %>%
+  mutate(model = 'M_Kim_2018_hacked', training_data = "D_Kim_2018_train")
+panpam_hacked_predictions <- raw_predictions %>%
+  filter(test_data == 'D_enCas12a_PAM_tiling_test') %>%
+  select(kmer, y, group, test_data) %>%
+  distinct() %>%
+  left_join(minimal_hacked_scores)
+bound_panpam_gene_cors <- bind_rows(raw_predictions %>%
+                                        filter(test_data == 'D_enCas12a_PAM_tiling_test',
+                                               training_data != 'D_2xCas12a_TTTN_tiling_train'),
+                                       panpam_hacked_predictions) %>%
+  group_by(group, model, training_data, test_data) %>%
+  summarise(spearman = cor(y, prediction, method = 'spearman', use = 'pairwise.complete.obs')) %>%
+  drop_na() %>%
+  ungroup() %>%
+  mutate(model = fct_recode(model, 'CNN' = 'M_Kim_2018', 'GB' = 'M_Doench_2016',
+                                   'Modified CNN' = 'M_Kim_2018_hacked'),
+                training_data = fct_recode(training_data, 
+                                           'Seq-DeepCpf1\n(Indel Freq.)' = 'D_Kim_2018_train',
+                                           'PAM Tiling\n(Percentile)' = 'D_enCas12a_PAM_tiling_train')) %>%
+  mutate(model = fct_reorder(model, spearman, .fun = mean), 
+         training_data = fct_reorder(training_data, spearman, .fun = mean))
+bound_panpam_sum_cors <- bound_panpam_gene_cors %>%
+  group_by(model, training_data) %>%
+  summarise(mean_cor = mean(spearman), 
+            sd_cor = sd(spearman),
+            n = n()) %>%
+  ungroup() %>%
+  mutate(model = fct_reorder(model, mean_cor, .fun = mean), 
+         training_data = fct_reorder(training_data, mean_cor, .fun = mean))
+
+ggplot(bound_panpam_sum_cors) +
+  aes(x = model, fill = model) +
+  geom_col(aes(y = mean_cor), position = position_dodge2(width = 0.9, preserve = 'single')) +
+  geom_linerange(position = position_dodge2(width = 0.9, preserve = 'single'), 
+                 aes(y = mean_cor, ymin = mean_cor - sd_cor, ymax = mean_cor + sd_cor)) +
+  geom_point(data = bound_panpam_gene_cors, aes(y = spearman), show.legend = F, size = 1,
+             alpha = 0.5, pch = 16) +
+  scale_fill_brewer(palette = 'Set2') +
+  ylab('Avg. Spearman Correlation') +
+  xlab('Training Data') +
+  theme_minimal() +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(size = 8),
+        legend.position = 'right',
+        legend.key.size = unit(0.3, 'cm'),
+        title = element_text(size = 8),
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"), 
+        axis.text.x = element_blank()) +
+  facet_grid(cols = vars(training_data), scales = 'free', space = 'free',
+             switch = 'x') +
+  ggtitle('enCas12a PAM tiling hold out set')
+ggsave(here('figures', 'avg_cor.svg'), width = 8.5, height = 5.5, units = 'cm')
+
+```
+
+```{r}
+hacked_scores_tttn <- read_tsv(here('data', 'predictions', 'tttn_tiling_designs.txt'))
+minimal_hacked_scores_tttn <- hacked_scores_tttn %>%
+  select(`sgRNA Context Sequence`, `On-Target Efficacy Score`) %>%
+  rename(kmer = `sgRNA Context Sequence`, prediction = `On-Target Efficacy Score`) %>%
+  mutate(model = 'M_Kim_2018_hacked', training_data = "D_Kim_2018_train")
+panpam_hacked_predictions <- raw_predictions %>%
+  filter(test_data == 'D_enCas12a_TTTN_tiling_test') %>%
+  select(kmer, y, group, test_data) %>%
+  distinct() %>%
+  left_join(minimal_hacked_scores_tttn)
+positive_control_test <- raw_predictions %>%
+  filter(test_data == "D_enCas12a_TTTN_tiling_test",
+         training_data != 'D_2xCas12a_TTTN_tiling_train') %>%
+  bind_rows(panpam_hacked_predictions) %>%
+  drop_na()
+positive_control_cors <- positive_control_test %>%
+  group_by(group, model, training_data) %>%
+  summarise(spearman = cor(y, prediction, method = 'spearman')) %>%
+  ungroup() %>%
+  mutate(model = factor(model, levels = c('M_Kim_2018', 'M_Doench_2016', 'M_Kim_2018_hacked')), 
+         training_data = fct_reorder(training_data, spearman, .fun = mean))
+ggplot(positive_control_cors) +
+  aes(x = training_data, y = spearman, color = model, group = model, shape = group) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  scale_color_brewer(palette = 'Set2') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+```{r}
+pam_tiers <- read_csv(here('data', 'meta_information', 'PAM_tier.csv'))
+optimal_predictions <- raw_predictions %>%
+  filter(test_data == 'D_enCas12a_PAM_tiling_test', model == 'M_Doench_2016',
+         training_data == 'D_enCas12a_PAM_tiling_train') %>%
+  mutate(PAM = str_sub(kmer, 5, 8)) %>%
+  inner_join(pam_tiers) %>%
+  mutate(Tier = factor(Tier, levels = c('TTTV', 'Tier 1', 'Tier 2', 'Tier 3',
+                                        'No Tier')),
+         mean_rank = (y + prediction)/2)
+ggplot(optimal_predictions) +
+  aes(x = y, y = prediction, color = Tier) +
+  geom_point(pch = 16, size = 0.8) +
+  theme_minimal() +
+  theme(aspect.ratio = 1) + 
+  scale_color_brewer(palette = 'Paired') +
+  theme(text = element_text(family = 'Arial', size = 10),
+      axis.text = element_text(size = 8),
+      legend.position = 'right',
+      legend.key.size = unit(0.3, 'cm'),
+      title = element_text(size = 8),
+      legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm")) +
+  xlab('observed percentile') +
+  ylab('predicted percentile') +
+  labs(title = 'enCas12a PAM tiling', 
+       subtitle = 'GB model')
+ggsave(here('figures', 'GB_predictions.svg'), width = 8.5, height = 6, units = 'cm')
+```
+
+
+```{r}
+tttv_guide <- optimal_predictions %>%
+  filter(Tier == 'TTTV') %>%
+  top_n(1, mean_rank) %>%
+  select(kmer) %>%
+  unlist() %>% 
+  as.character()
+tier1_guide <- optimal_predictions %>%
+  filter(Tier == 'Tier 1') %>%
+  top_n(1, mean_rank) %>%
+  select(kmer) %>%
+  unlist() %>% 
+  as.character()
+tier2_guide <- optimal_predictions %>%
+  filter(Tier == 'Tier 2') %>%
+  top_n(1, mean_rank) %>%
+  select(kmer) %>%
+  unlist() %>% 
+  as.character()
+tier3_guide <- optimal_predictions %>%
+  filter(Tier == 'Tier 3') %>%
+  top_n(1, mean_rank) %>%
+  select(kmer) %>%
+  unlist() %>% 
+  as.character()
+notier_guide <- optimal_predictions %>%
+  filter(Tier == 'No Tier') %>%
+  top_n(1, mean_rank) %>%
+  select(kmer) %>%
+  unlist() %>% 
+  as.character()
+```
+
+```{python}
+from sgrna_modeler.mutagenesis import mutagenize_seq
+optimal_model = trained_models['M_Doench_2016' + ':' + 'D_enCas12a_PAM_tiling_train']
+guides = [r.tttv_guide, r.tier1_guide, r.tier2_guide, r.tier3_guide, r.notier_guide]
+importances = []
+for guide in guides:
+  nt_importance = mutagenize_seq(guide, optimal_model)
+  importances.append(nt_importance)
+importances_df = pd.concat(importances)
+```
+
+```{r}
+arranged_importance = py$importances_df %>%
+  inner_join(optimal_predictions, by = c('context' = 'kmer')) %>%
+  mutate(context = fct_reorder(context, mean_rank))
+```
+
+```{r}
+plot_seq_logo <- function(variant_df) {
+  p <-  ggplot(variant_df) +
+    aes(x = pos, label = nt, y = importance, lineheight = importance, 
+        fill = nt) +
+    geom_col() +
+    scale_fill_manual(values = c('#109648', '#255C99', '#F7B32B', '#D62839')) +
+    geom_text(vjust = 0)
+  return(p)
+}
+plot_seq_logo(arranged_importance) +
+  facet_wrap('Tier', nrow = 5)
+ggsave(here('figures', 'example_seq_saliency.png'), width = 5, height = 7)
+```
+
+```{python}
+from sgrna_modeler.mutagenesis import mutagenize_model
+optimal_delta_df = mutagenize_model(optimal_model, 30000)
+deepcpf1_delta_df = mutagenize_model(deepcpf1, 30000)
+```
+
+
+
+```{r}
+library(ggseqlogo)
+summarize_deltas <- function(deltas) {
+  delta_summary <- deltas %>%
+    group_by(nt, position) %>%
+    summarise(mean_delta = mean(delta))
+  spread_summary <- delta_summary %>%
+    pivot_wider(names_from = position, values_from = mean_delta) %>%
+    column_to_rownames('nt') %>%
+    as.matrix()
+  p <- ggseqlogo(spread_summary, method = "custom") +
+    xlab('Position') +
+    ylab('Relative Importnace') +
+    scale_x_continuous(breaks = seq(0, 35, 5))
+  return(list(sum = delta_summary, p = p))
+}
+optimal_delta_analysis <- summarize_deltas(py$optimal_delta_df)
+deepcpf1_delta_analysis <- summarize_deltas(py$deepcpf1_delta_df %>%
+                                              mutate(delta = if_else((position < 5 | position > 7), delta, 0)))
+```
+
+```{r}
+optimal_delta_analysis$p +
+  theme_minimal() +
+  theme(text = element_text(family = 'Arial', size = 10),
+      axis.text = element_text(size = 8),
+      legend.position = 'right',
+      legend.key.size = unit(0.3, 'cm'),
+      title = element_text(size = 8),
+      legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm")) +
+  ylab('Avg. Percentile Change') +
+  ggtitle('enCas12a PAM Tiling GB model')
+ggsave(here('figures', 'optimal_model_saliency.svg'), width = 9, height = 5.5, units = 'cm')
+```
+
+```{python}
+panpam_test = load_panpam_test()
+panpam_test_df = panpam_test.data
+```
+
+```{r}
+panpam_test_df <- as_tibble(py$panpam_test_df) %>%
+  mutate(sg4 = str_sub(`Context Sequence`, 12, 12),
+         sg4_6 = str_sub(`Context Sequence`, 12, 14), 
+         G4 = sg4 == 'G', 
+         GGA4_6 = sg4_6 == 'GGA')
+wilcox_test = wilcox.test(panpam_test_df$activity_rank[panpam_test_df$G4], 
+                          panpam_test_df$activity_rank[!panpam_test_df$G4]) %>%
+  broom::tidy() %>%
+  mutate(p = paste('Wilcoxon p =', as.character(format(signif(p.value, 2)))))
+ggplot(panpam_test_df) +
+  geom_boxplot(fill = 'grey80') +
+  aes(x = G4, y = activity_rank) +
+  geom_text(data = wilcox_test, aes(x = -Inf, y = Inf, label = p), hjust = 0, vjust = 1.6, 
+            size = 2.83, family = 'Arial') +
+  xlab('G in the 4th guide position') +
+  ggtitle('enCas12a PAM tiling\nhold out set') +
+  ylab('Activity Percentile') +
+  theme_minimal() +
+  theme(text = element_text(family = 'Arial', size = 10),
+      axis.text = element_text(size = 8),
+      legend.position = 'right',
+      legend.key.size = unit(0.3, 'cm'),
+      title = element_text(size = 8),
+      legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"))
+
+ggsave(here('figures', 'G4_comparison.svg'), width = 6, height = 6, units = 'cm')
+```
+
+
+```{r}
+deepcpf1_delta_analysis$p +
+  theme_minimal() +
+  theme(text = element_text(family = 'Arial', size = 10),
+      axis.text = element_text(size = 8),
+      legend.position = 'right',
+      legend.key.size = unit(0.3, 'cm'),
+      title = element_text(size = 8),
+      legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm")) +
+  ylab('Avg. Indel Freq. Change') +
+  ggtitle('Seq-DeepCpf1 model')
+ggsave(here('figures', 'deepcpf1_saliency.svg'), width = 9, height = 5.5, units = 'cm')
+```
+
+```{python}
+from joblib import dump
+dump(optimal_model.model, '../data/model_weights/enPAM_GB.joblib')
+```
+
+```{r}
+py_save_object(py$trained_models, 'trained_models.pkl')
+```
+

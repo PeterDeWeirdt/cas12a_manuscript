@@ -1,0 +1,197 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(tidyverse)
+library(here)
+```
+
+```{r}
+gene_cell_conditions <- read_csv(here('data','raw','gene_cell_conditions.csv'))
+cas12a_context_scores <- read_csv(here('data', 'external', 'AABY09_DeepCpf1_Scores.csv')) %>%
+  mutate(`Seq-DeepCpf1 Score` = as.numeric(`Seq-DeepCpf1 Score`))
+rda_112_reads <- read_csv(here('data', 'raw', 'rda_112_tiling_reads.csv'), skip = 5)
+rda_174_reads <- read_csv(here('data', 'raw', 'rda_174_tiling_reads.csv'), skip = 5)
+joined_reads <- inner_join(rda_112_reads, rda_174_reads)
+tn_guides <- read_csv(here('data', 'external', 'Cas12a_trueneg.csv'))
+tp_guides <- read_csv(here('data', 'external', 'Cas12a_truepos.csv'))
+```
+
+```{r}
+calc_lognorm <- function(v) {
+  return(log2(((v/sum(v))*1000000) + 1))
+}
+
+calc_lfc <- function(reads) {
+  lognorms <- reads %>%
+    pivot_longer(contains('pDNA'), names_to = 'condition', values_to = 'reads') %>%
+    group_by(condition) %>%
+    mutate(lognorm = calc_lognorm(reads)) %>%
+    select(-reads)
+  gdna_lognorms <- lognorms %>%
+    filter(grepl(';',condition))
+  pdna_lognorms <- lognorms %>%
+    anti_join(gdna_lognorms) %>%
+    rename('pDNA' = 'condition')
+  lfcs <- gdna_lognorms %>%
+    separate(condition, c('Construct', 'Cell Line', 'Drug', 'Replicate', 'pDNA'), 
+             sep = ';') %>%
+    inner_join(pdna_lognorms, by = c('Construct Barcode', 'Gene ID','pDNA'),
+               suffix = c('', '_pDNA')) %>%
+    mutate(lfc = lognorm - lognorm_pDNA) %>%
+    select(-lognorm, -lognorm_pDNA) %>%
+    pivot_wider(values_from = lfc, names_from = Replicate) %>%
+    mutate(avg_lfc = (`Rep A` + `Rep B`)/2)
+  return(lfcs)
+}
+pan_lethal_genes <- c("EEF2", "HNRNPU", "PELP1", "TFRC", "SF3B1", "PSMA6", 
+                      "KPNB1", "SNRPD1", "RPS20", "POLR1C")
+flow_genes <- c('CD81', 'CD33', 'FAS', 'ICAM1')
+ 
+lfcs <- calc_lfc(joined_reads) 
+relevant_lfcs <- lfcs %>% filter(`Cell Line` %in% c('A375', 'HT29', 'MELJUSO'), 
+         Drug == 'Dropout') %>%
+  filter(!(`Cell Line` == 'MELJUSO' & pDNA == 'AABY09_pDNA_1')) %>%
+  mutate(Construct = fct_recode(Construct, 'enCas12a' = 'RDA_174', 
+                                '2xNLS-Cas12a' = 'RDA_112'))
+expected_lfcs <- relevant_lfcs %>%
+  filter(`Gene ID` %in% c(pan_lethal_genes, flow_genes)) %>%
+  inner_join(cas12a_context_scores) %>%
+  filter(PAM %in% c('TTTC', 'TTTG', 'TTTA')) %>%
+  mutate(essential = `Gene ID` %in% pan_lethal_genes, 
+         hit = as.factor(essential))
+all_guides_aucs <- expected_lfcs %>%
+  group_by_at(vars(Construct:Drug)) %>%
+  summarise(auc = AUC::auc(AUC::roc(-avg_lfc, hit)),
+            n = n(), 
+            essential = (sum(essential)),
+            nonessential = n - essential) %>%
+  arrange(-auc) %>%
+  mutate(guides = 'All')
+top_half_aucs <- expected_lfcs %>%
+  group_by_at(vars(Construct:Drug, essential)) %>%
+  filter(`Seq-DeepCpf1 Score` > median(`Seq-DeepCpf1 Score`, na.rm = T)) %>%
+  group_by_at(vars(Construct:Drug)) %>%
+  summarise(auc = AUC::auc(AUC::roc(-avg_lfc, hit)), 
+            n = n(), 
+            essential = (sum(essential)),
+            nonessential = n - essential) %>%
+  arrange(-auc) %>%
+  mutate(guides = 'Top Half')
+bound_aucs <- bind_rows(all_guides_aucs, top_half_aucs) %>%
+  select(-c(n, essential, nonessential))
+```
+
+```{r}
+bound_aucs %>%
+  pivot_wider(names_from = guides, values_from = auc) %>%
+  mutate(delta =`Top Half` - All)
+```
+
+
+```{r}
+ggplot(bound_aucs) +
+  aes(y = auc, x = Construct, size = guides, color = `Cell Line`, 
+      group = interaction(Construct, `Cell Line`)) +
+  geom_point(pch = 16, position = position_dodge(width = 0.9), 
+             alpha = 0.7) +
+  scale_size_manual(values = c(2, 1)) +
+  geom_path(arrow = arrow(length = unit(0.1, 'cm')),
+            position = position_dodge(width = 0.9), show.legend = F,
+            size = 0.2) +
+  scale_color_brewer(palette = 'Set1') +
+  guides(color = guide_legend(reverse = T)) +
+  coord_flip() +
+  ggtitle('Seq-DeepCpf1 Filtering') +
+  theme_minimal() +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(size = 8),
+        title = element_text(size = 8), 
+        legend.position = 'top',
+        legend.box = "vertical",
+        legend.key.size = unit(0.1, 'cm'),
+        legend.margin=margin(t=0, r=0, b=0, l=0, unit="cm"),
+        #axis.text.y = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.y=element_blank()) +
+  xlab('') +
+  guides(color = guide_legend(title = 'Cell', 
+                              nrow = 2))
+ggsave(here('figures','tiling', 'auc_improvement.svg'), width = 6, height = 7, 
+       units = 'cm')
+```
+
+```{r}
+flow_cutoffs <- relevant_lfcs %>%
+  filter(`Gene ID` %in% flow_genes) %>%
+  inner_join(cas12a_context_scores) %>%
+  filter(PAM %in% c('TTTC', 'TTTG', 'TTTA')) %>%
+  group_by_at(vars(Construct:Drug)) %>%
+  summarise(cutoff = quantile(avg_lfc, 0.05))
+dropout_lfcs <- relevant_lfcs %>%
+  filter(`Gene ID` %in% pan_lethal_genes) %>%
+  inner_join(cas12a_context_scores) %>%
+  filter(PAM %in% c('TTTC', 'TTTG', 'TTTA')) %>%
+  inner_join(flow_cutoffs) %>%
+  mutate(active = avg_lfc < cutoff)
+binned_dropout <- dropout_lfcs %>%
+  filter(!is.na(`Seq-DeepCpf1 Score`)) %>%
+  mutate(`Seq-DeepCpf1 Bin` = cut(`Seq-DeepCpf1 Score`, seq(0, 100, 10))) %>%
+  mutate(Construct = factor(Construct, c('enCas12a', '2xNLS-Cas12a')))
+ggplot(binned_dropout) +
+  aes(x = `Seq-DeepCpf1 Bin`, fill = active) +
+  geom_histogram(stat = 'count') +
+  facet_grid(rows = vars(`Cell Line`), cols = vars(`Construct`), 
+             scales = 'free') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.position = 'top') +
+  guides(fill = guide_legend(reverse = T)) +
+  scale_fill_brewer(palette = 'Paired')
+```
+
+```{r}
+binned_dropout %>%
+  group_by(`Seq-DeepCpf1 Bin`, Construct, `Cell Line`) %>%
+  summarise(fraction_active = sum(active)/n())
+```
+
+```{r}
+binned_dropout %>%
+  group_by(Construct, `Cell Line`) %>%
+  filter(`Seq-DeepCpf1 Score` >  60) %>%
+  summarise(fraction_active = sum(active)/n())
+```
+
+
+```{r}
+binned_scores <- binned_dropout %>%
+  filter(Construct == '2xNLS-Cas12a')
+ggplot(binned_scores) +
+  aes(x = `Seq-DeepCpf1 Bin`, fill = active) +
+  geom_histogram(stat = 'count') +
+  facet_grid(cols = vars(`Construct`), rows = vars(`Cell Line`), 
+             scales = 'free') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        legend.position = 'top') +
+  guides(fill = guide_legend(reverse = T)) +
+  scale_fill_brewer(palette = 'Paired') +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(size = 8),
+        legend.position = 'top',
+        legend.key.size = unit(0.1, 'cm'),
+        title = element_text(size = 8),
+        legend.margin=margin(t=0, r=0, b=-0.3, l=0, unit="cm"))
+ggsave(here('figures','tiling', 'a375_activity.svg'), width = 6, height = 7, 
+       units = 'cm')
+```
+
+
+```{r}
+ggsave(here('figures', 'ML', 'deepcpf1_bins.png'), width = 5, height = 5)
+```
+
+```{r}
+sessionInfo()
+```

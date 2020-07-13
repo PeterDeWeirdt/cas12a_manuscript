@@ -1,0 +1,151 @@
+---
+title: "R Notebook"
+---
+
+## Setup
+
+```{r}
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(extrafont)
+library(cutr)
+loadfonts()
+rda_174_lfcs <- read_csv(here('data','interim',
+                              'RDA_174_LFC.csv')) %>%
+  separate(`Construct IDs`, c('Guide Sequence', 'Gene'), sep = ';')
+
+eef2_predictions <- read_tsv(here('data','external',
+                                  'deepcpf1_hacked_eef2_output.txt'))
+eef2_tiers <- read_tsv(here('data','external','Tier_input_v2.txt')) %>%
+  select(PAM, Tier) %>%
+  mutate(Tier = ifelse(grepl('TTT(A|C|G|T)', PAM), 'TTTN', Tier), 
+         Tier = fct_recode(Tier, 'none' = 'Tier 4'), 
+         Tier = factor(Tier, levels = c('TTTN', 'Tier 1', 'Tier 2', 'Tier 3', 'none'))) %>%
+  mutate(`PAM 1-3 T Count` = as.factor(str_count(substr(PAM,1,3), 'T')))
+```
+
+```{r}
+eef2_predictions_tiers <- inner_join(eef2_predictions, eef2_tiers) %>%
+    mutate(sequence_type = word(sequence_type, 1, sep = '_'))
+tttv_avg_predictions <- eef2_predictions_tiers %>%
+  filter(sequence_type %in% c('TTTA', 'TTTC', 'TTTG')) %>%
+  group_by_at(vars(`Context Sequence`:end_context, Tier)) %>%
+  summarise(`Seq-DeepCpf1 Score` = mean(`Seq-DeepCpf1 Score`))%>%
+  mutate(sequence_type = 'TTTV Avg.')
+eef2_expanded_predictions <- bind_rows(eef2_predictions_tiers, tttv_avg_predictions)
+```
+
+```{r}
+flow_controls <- c('CD81','ICAM1','FAS','CD33')
+flow_lfcs <- rda_174_lfcs %>%
+  filter(Gene %in% flow_controls) %>%
+  mutate(avg_lfc = (`A375|RDA_174|no drug|NA|pDNA|A|LFC` + 
+                      `A375|RDA_174|no drug|NA|pDNA|B|LFC`)/2)
+flow_cutoff <- quantile(flow_lfcs$avg_lfc, 0.05)
+eef2_binarized <- eef2_expanded_predictions %>%
+  mutate(active = as.numeric(Avg_LFC < flow_cutoff))
+eef2_tiers_percent_active = eef2_binarized %>%
+  filter(sequence_type == 'Orig') %>%
+  group_by(Tier) %>%
+  summarise(n = n(),
+    fraction_active = round(sum(active)/n, 2),
+    active_label = paste0(fraction_active*100, '%'), 
+    n_label = paste0('n=', n))
+ggplot(eef2_binarized %>% filter(sequence_type == 'Orig')) +
+  aes(x = Tier, y = Avg_LFC, fill = Tier, alpha = Tier) +
+  geom_boxplot(show.legend = FALSE) +
+  geom_label(size = 3, data = eef2_tiers_percent_active, aes(label = active_label, 
+                                                   x = Tier, y = -6), show.legend = FALSE) +
+  geom_label(size = 3, data = eef2_tiers_percent_active, aes(label = n_label, 
+                                                   x = Tier, y = 2.5), show.legend = FALSE) +
+  geom_hline(yintercept = flow_cutoff, linetype = 'dashed') +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial')) +
+  ggtitle('enCas12a EEF2 Guides') +
+  xlab('PAM') + 
+  ylab('Avg. LFC') +
+  scale_fill_manual(values = c('#4878d0', '#4878d0', '#ee854a', '#6acc64', 'darkgrey')) +
+  scale_alpha_manual(values = c(0.5,1,1,1,1))
+  
+ggsave(here('figures','ML','EEF2_guide_activity.pdf'), width = 9, height = 9, units = 'cm', device = cairo_pdf)
+```
+
+```{r}
+filtered_predictions <- eef2_expanded_predictions %>%
+  filter(!(Tier %in% c('TTTN', 'none')), 
+         !sequence_type == 'TTTT') %>%
+  mutate(Tier = fct_drop(Tier))
+tier_grouped_correlations <- filtered_predictions %>%
+  group_by(Tier, sequence_type) %>%
+  summarise(correlation = cor(`Seq-DeepCpf1 Score`, `Avg_LFC`, method = 'spearman'), 
+            n = n()) %>%
+  mutate(sequence_type = fct_reorder(sequence_type, correlation, .fun = mean))
+
+ggplot(tier_grouped_correlations) +
+  aes(y = correlation, x = sequence_type, fill = sequence_type, label = n) +
+  geom_bar(stat = 'identity', position = "dodge") +
+  theme_classic() +
+  scale_fill_brewer(palette = 'Set2') +
+  facet_wrap('Tier') +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        legend.position = 'top',
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.line.x = element_blank(), 
+        legend.key.size = unit(0.3,'cm')) +
+  guides(fill = guide_legend(title = 'Hack')) +
+  ylab('Correlation')
+ggsave(here('figures','ML','EEF2_predictions.svg'), width = 9, height = 6, units = 'cm')
+```
+
+```{r}
+binned_tttc_predictions <- filtered_predictions %>%
+  filter(sequence_type == 'TTTC') %>%
+  group_by(Tier) %>%
+  nest() %>%
+  mutate(`Predicted Bin` = map(data, function(df) smart_cut(df$`Seq-DeepCpf1 Score`, 
+                                          as.numeric(quantile(df$`Seq-DeepCpf1 Score`)),
+                                          sep = ', ', digits = 3, format_fun = signif)), 
+         `Predicted Quartile` = map(`Predicted Bin`, function(v) as.numeric(v)),
+         `Predicted Bin` = map(`Predicted Bin`, as.character)) %>%
+  unnest(c(data, `Predicted Bin`, `Predicted Quartile`)) %>%
+  mutate(`Predicted Bin` = fct_reorder(as.factor(`Predicted Bin`), `Predicted Quartile`), 
+         min_score = str_extract(`Predicted Bin`, pattern = '(?<=\\[).*(?=\\,)'),
+         label = paste0('Q', `Predicted Quartile`, '\n', min_score)) %>%
+  mutate(label = fct_reorder(label, as.numeric(min_score)))
+
+tttc_bins_percent_active = binned_tttc_predictions %>%
+  mutate(active = Avg_LFC < flow_cutoff) %>%
+  group_by(Tier, label) %>%
+  summarise(n = n(),
+    fraction_active = round(sum(active)/n, 2),
+    active_label = paste0(fraction_active*100, '%'), 
+    n_label = paste0('n=', n))
+
+ggplot(binned_tttc_predictions) +
+  aes(x = label, y = `Avg_LFC`, fill = Tier) +
+  geom_boxplot(show.legend = FALSE) +
+  geom_label(size = 3, data = tttc_bins_percent_active, aes(label = active_label, y = -6), 
+             show.legend = FALSE, label.padding = unit(0.05, 'cm')) +
+  ggtitle('enCas12a EEF2 Guides: TTTC Hacked PAM') +
+  facet_wrap('Tier', scales = 'free_x') +
+  geom_hline(yintercept = flow_cutoff, linetype = 'dashed') +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial')) +
+  ylab('Avg. LFC') +
+  scale_fill_manual(values = c('#4878d0', '#ee854a', '#6acc64')) +
+  xlab('Seq-DeepCpf1 Quartiles, Min Score')
+ggsave(here('figures', 'ML','hacked_pam_predictions.pdf'), 
+       width = 12, height = 9, units = 'cm', device=cairo_pdf)
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
